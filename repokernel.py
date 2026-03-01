@@ -124,6 +124,7 @@ class KernelApp:
 
         tb.Label(git_frame, text="Usuario Git:").pack(side=LEFT, padx=5)
         self.txt_user = tb.Entry(git_frame)
+        self.txt_user.insert(0, "polo2020")
         self.txt_user.pack(side=LEFT, fill=X, expand=YES, padx=5)
 
         tb.Label(git_frame, text="Repo:").pack(side=LEFT, padx=5)
@@ -289,6 +290,11 @@ class KernelApp:
             self.log_comp(">>> Paso 5: Generando configuración (make defconfig)...")
             subprocess.run(["make", "defconfig"], check=True)
 
+            # ============================================
+            # 🚀 OPTIMIZACIONES ZEN / LIQUORIX KERNEL
+            # ============================================
+            self.log_comp(">>> [🚀] Aplicando optimizaciones Zen Interactive Tuning...")
+
             # Inyección de Optimizaciones
             if "selected" in self.c_intel.state():
                 self.log_comp(">>> [Opt] MCORE2 activado.")
@@ -300,6 +306,158 @@ class KernelApp:
             if "selected" in self.c_liq.state():
                 self.log_comp(">>> [Opt] PREEMPT (Zen) activado.")
                 subprocess.run([cfg, "--enable", "CONFIG_PREEMPT"], check=True)
+
+            # === ZEN TUNING: Responsiveness over throughput ===
+            self.log_comp(">>> [Zen] Aplicando tuning para responsividad...")
+
+            # --- Block Layer / I/O Scheduler ---
+            self.log_comp(">>> [Zen] Block Layer: Kyber (mq) / BFQ (sq)...")
+            subprocess.run([cfg, "--set-val", "CONFIG_MQ_IOSCHED_DEADLINE", "y"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_MQ_IOSCHED_KYBER", "y"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_IOSCHED_BFQ", "y"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_BFQ_GROUP_IOSCHED", "y"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_DEFAULT_KYBER", "y"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_DEFAULT_IOSCHED", "kyber"], check=True)
+
+            # --- Virtual Memory Subsystem ---
+            self.log_comp(">>> [Zen] VM: Background reclaim hugepages, no compact unevictable...")
+            subprocess.run([cfg, "--enable", "CONFIG_TRANSPARENT_HUGEPAGE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_TRANSPARENT_HUGEPAGE_MADVISE"], check=True)
+            subprocess.run([cfg, "--disable", "CONFIG_COMPACTION"], check=False)
+            subprocess.run([cfg, "--set-val", "CONFIG_WATERMARK_SCALE_FACTOR", "0"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_VM_EVENT_COUNTERS", "y"], check=True)
+
+            # --- CPU Scheduler PDS/BMQ ---
+            self.log_comp(">>> [Zen] PDS Scheduler: Timeslice 2ms para gaming/real-time...")
+            subprocess.run([cfg, "--enable", "CONFIG_SCHED_PDS"], check=False)
+            subprocess.run([cfg, "--enable", "CONFIG_SCHED_BMQ"], check=False)
+            subprocess.run([cfg, "--set-val", "CONFIG_PDS_TIMESLICE", "2"], check=False)
+            # Alternativa: EEVDF con tuning
+            subprocess.run([cfg, "--enable", "CONFIG_SCHED_EEVDF"], check=True)
+
+            # --- CPUFreq: Ondemand tuning ---
+            self.log_comp(">>> [Zen] CPUFreq: Ondemand optimizado (threshold 55%)...")
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ_GOV_ONDEMAND"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ_GOV_PERFORMANCE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ_GOV_POWERSAVE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ_GOV_USERSPACE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ_GOV_CONSERVATIVE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_CPU_FREQ_GOV_SCHEDUTIL"], check=True)
+            # Thresholds optimizados
+            subprocess.run([cfg, "--set-val", "CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND", "y"], check=True)
+
+            # --- Split Lock Detection: OFF para rendimiento ---
+            self.log_comp(">>> [Zen] Split Lock Detection: OFF (mejor rendimiento)...")
+            subprocess.run([cfg, "--disable", "CONFIG_SPLIT_LOCK_DETECT"], check=False)
+            subprocess.run([cfg, "--set-val", "CONFIG_SLD", "n"], check=False)
+
+            # === HARD KERNEL PREEMPTION ===
+            self.log_comp(">>> [Zen] Hard Kernel Preemption: Máxima responsividad...")
+            subprocess.run([cfg, "--enable", "CONFIG_PREEMPT_VOLUNTARY"], check=False)
+            subprocess.run([cfg, "--enable", "CONFIG_PREEMPT"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PREEMPT_COUNT"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PREEMPTION"], check=True)
+            # Tree-based RCU para real-time
+            subprocess.run([cfg, "--enable", "CONFIG_TREE_RCU"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PREEMPT_RCU"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_RCU_EXPERT"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_RCU_BOOST"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_RCU_BOOST_PRIO", "1"], check=True)
+
+            # === HIGH RESOLUTION SCHEDULING ===
+            self.log_comp(">>> [Zen] High Resolution: 1000Hz tick rate...")
+            subprocess.run([cfg, "--set-val", "CONFIG_HZ_1000"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_HZ", "1000"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_HIGH_RES_TIMERS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NO_HZ"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NO_HZ_IDLE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NO_HZ_FULL"], check=True)
+            subprocess.run([cfg, "--enable", "CONTEXT_TRACKING"], check=True)
+
+            # === TCP BBR2 CONGESTION CONTROL ===
+            self.log_comp(">>> [Zen] TCP BBR2: Máximo throughput de red...")
+            subprocess.run([cfg, "--enable", "CONFIG_TCP_CONG_ADVANCED"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_TCP_CONG_BIC"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_TCP_CONG_CUBIC"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_TCP_CONG_BBR"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_DEFAULT_TCP_CONG", "bbr"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_TCP_BBR Congestion Control"], check=False)
+
+            # === NETWORK OPTIMIZATIONS ===
+            self.log_comp(">>> [Zen] Red: Optimizaciones de rendimiento...")
+            subprocess.run([cfg, "--enable", "CONFIG_NETFILTER"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NETFILTER_ADVANCED"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NET_SCH_FIFO"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NET_SCH_CODEL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NET_SCH_FQ"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NET_SCH_FQ_CODEL"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_DEFAULT_NET_SCH", "fq"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_RPS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_RFS_ACCEL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_XPS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NET_RX_BUSY_POLL"], check=True)
+
+            # === KERNEL PREEMPT MODEL ===
+            self.log_comp(">>> [Zen] Preemptible Tree-based RCU...")
+            subprocess.run([cfg, "--enable", "CONFIG_RCU_STALL_COMMON"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_RCU_CPU_STALL_TIMEOUT", "21"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_RCU_CPU_STALL_INFO"], check=True)
+
+            # === DESKTOP / GAMING OPTIMIZATIONS ===
+            self.log_comp(">>> [Zen] Optimizaciones para Desktop/Gaming...")
+            subprocess.run([cfg, "--enable", "CONFIG_LATENCYTOP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_DEBUG_ATOMIC_SLEEP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_DETECT_HUNG_TASK"], check=True)
+            subprocess.run([cfg, "--set-val", "CONFIG_DETECT_HUNG_TASK_TIMEOUT_SEC", "120"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_SCHED_AUTOGROUP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_BLK_DEV_IO_TRACE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_FTRACE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_FUNCTION_TRACER"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_FUNCTION_GRAPH_TRACER"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_DYNAMIC_FTRACE"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_FTRACE_SYSCALLS"], check=True)
+
+            # === POWER MANAGEMENT OPTIMIZATIONS ===
+            self.log_comp(">>> [Zen] Power Management equilibrado...")
+            subprocess.run([cfg, "--enable", "CONFIG_PM"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PM_SLEEP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PM_SLEEP_SMP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PM_AUTOSLEEP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PM_WAKELOCKS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_ACPI"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_ACPI_SLEEP"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_ACPI_PROCESSOR"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_ACPI_THERMAL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_X86_ACPI_CPUFREQ"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_X86_PCC_CPUFREQ"], check=True)
+
+            # === FILESYSTEM OPTIMIZATIONS ===
+            self.log_comp(">>> [Zen] Filesystem: Optimizaciones de I/O...")
+            subprocess.run([cfg, "--enable", "CONFIG_EXT4_FS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_EXT4_FS_POSIX_ACL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_BTRFS_FS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_BTRFS_FS_POSIX_ACL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_XFS_FS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_XFS_QUOTA"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_XFS_POSIX_ACL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_F2FS_FS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_F2FS_FS_XATTR"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_F2FS_FS_POSIX_ACL"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NTFS3_FS"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_NTFS3_LZX_XPRESS"], check=True)
+
+            # === PARAVIRTUALIZATION (reducir overhead) ===
+            self.log_comp(">>> [Zen] Paravirtualización: Reducir overhead...")
+            subprocess.run([cfg, "--enable", "CONFIG_PARAVIRT"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_PARAVIRT_TIME_ACCOUNTING"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_KVM_GUEST"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_VIRTIO"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_VIRTIO_PCI"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_VIRTIO_BALLOON"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_VIRTIO_NET"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_VIRTIO_BLK"], check=True)
+            subprocess.run([cfg, "--enable", "CONFIG_VIRTIO_CONSOLE"], check=True)
 
             # === DRIVERS ESPECÍFICOS PARA TU HARDWARE ===
             self.log_comp(">>> [HW] Activando soporte para Qualcomm Atheros AR9485 WiFi...")
