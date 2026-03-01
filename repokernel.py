@@ -1087,6 +1087,35 @@ class KernelApp:
                     for f in os.listdir(self.deb_folder):
                         if f.endswith(".deb"):
                             self.log_comp(f"   ✓ {f}")
+
+                    # === INYECTAR OPTIMIZACIONES ZEN EN LOS .DEB ===
+                    self.log_comp(">>> [🚀] Inyectando optimizaciones Zen en los paquetes .deb...")
+                    self.log_comp(">>> Estas optimizaciones se aplicarán automáticamente al instalar")
+
+                    # Ejecutar script de inyección
+                    inject_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inject_zen_optimizations.sh")
+                    if os.path.exists(inject_script):
+                        try:
+                            result = subprocess.run(
+                                ["bash", inject_script],
+                                cwd=self.deb_folder,
+                                capture_output=True,
+                                text=True,
+                                timeout=120
+                            )
+                            for line in result.stdout.splitlines():
+                                self.log_comp(f"   {line}")
+                            if result.returncode == 0:
+                                self.log_comp(">>> [🚀] Optimizaciones Zen inyectadas exitosamente")
+                            else:
+                                self.log_comp(f">>> [🚀] Advertencia: {result.stderr}")
+                        except subprocess.TimeoutExpired:
+                            self.log_comp(">>> [🚀] Timeout inyectando optimizaciones - continuando")
+                        except Exception as e:
+                            self.log_comp(f">>> [🚀] Error inyectando optimizaciones: {e}")
+                    else:
+                        self.log_comp(">>> [🚀] Script inject_zen_optimizations.sh no encontrado")
+                        self.log_comp(">>> [🚀] Ejecuta manualmente: ./inject_zen_optimizations.sh")
                 else:
                     self.log_comp(">>> ERROR CRÍTICO: No se encontraron .deb en NINGUNA ubicación")
                     self.log_comp(">>> Posibles causas:")
