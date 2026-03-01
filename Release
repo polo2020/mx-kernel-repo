@@ -1,0 +1,8 @@
+Origin: polo2020
+Label: MX-Kernel-Repo
+Suite: stable
+Codename: ./
+Date: dom, 01 mar 2026 01:01:18 +0000
+Architectures: amd64
+Components: main
+Description: Repositorio Kernel Yean Carlos
