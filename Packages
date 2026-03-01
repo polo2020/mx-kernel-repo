@@ -1,0 +1,57 @@
+Package: linux-headers-6.19.5
+Source: linux-upstream
+Version: 6.19.5-1
+Architecture: amd64
+Maintainer: jean <jean@mx>
+Installed-Size: 55060
+Filename: ./linux-headers-6.19.5_6.19.5-1_amd64.deb
+Size: 9435216
+MD5sum: 4f7c5c9927cb9108c7e84faa87e84799
+SHA1: bd58400bd4e1cb69f9146fee859a4b8e14e41682
+SHA256: 0166037eb6d3330a96bdc0ab7dc7d92a4aad72bdb727aad3d8c1529a77e0888b
+Section: kernel
+Priority: optional
+Homepage: https://www.kernel.org/
+Description: Linux kernel headers for 6.19.5 on amd64
+ This package provides kernel header files for 6.19.5 on amd64
+ .
+ This is useful for people who need to build external modules
+
+Package: linux-image-6.19.5
+Source: linux-upstream
+Version: 6.19.5-1
+Architecture: amd64
+Maintainer: jean <jean@mx>
+Installed-Size: 30925
+Filename: ./linux-image-6.19.5_6.19.5-1_amd64.deb
+Size: 20496060
+MD5sum: 6361b8f95ce7e0301ce33641e0bd12d8
+SHA1: 781b7e357b6cb8c5f112b51b66598e0f85ee5d7c
+SHA256: 1eb2d04d59d62af62d8f8fd53a48d685957e019bf9e27d74cf6269dfed2235a2
+Section: kernel
+Priority: optional
+Homepage: https://www.kernel.org/
+Description: Linux kernel, version 6.19.5
+ This package contains the Linux kernel, modules and corresponding other
+ files, version: 6.19.5.
+
+Package: linux-libc-dev
+Source: linux-upstream
+Version: 6.19.5-1
+Architecture: amd64
+Maintainer: jean <jean@mx>
+Installed-Size: 7646
+Provides: linux-kernel-headers
+Filename: ./linux-libc-dev_6.19.5-1_amd64.deb
+Size: 1481724
+MD5sum: 0aa074b1e7bd44caa1539f74d902297d
+SHA1: f83625591dbe89f41ed1185c4c69255321eaf056
+SHA256: c6d3e9d3122c350b1bade86ebde84e9aae101a40b57747c46924f6f9959f52d8
+Section: devel
+Priority: optional
+Multi-Arch: same
+Homepage: https://www.kernel.org/
+Description: Linux support headers for userspace development
+ This package provides userspaces headers from the Linux kernel.  These headers
+ are used by the installed headers for GNU glibc and other system libraries.
+

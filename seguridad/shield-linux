@@ -1,0 +1,2753 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🛡️ SHIELD LINUX v5.0 - Sistema de Seguridad Avanzado con IA (NIVEL EXTREMO)
+Daemon de monitoreo y protección automática para UFW con funciones de seguridad de nivel militar:
+- Honeypot Dinámico y TCP Sinkhole
+- Connection Rate Shaping y SYN Cookie
+- Threat Intelligence Feeds (AbuseIPDB, Spamhaus)
+- Ban en Cascada de subnets completas
+- Tarpitting para consumir recursos del atacante
+- YARA Rules Integration para detección de malware
+- Sigma Rules Engine para técnicas MITRE ATT&CK
+- Log Correlation entre UFW, auth.log, syslog
+"""
+
+import os
+import subprocess
+import re
+import time
+import json
+import hashlib
+import socket
+import struct
+import math
+import random
+import threading
+import hashlib
+from datetime import datetime, timedelta
+from collections import Counter, defaultdict, deque
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Set, Deque
+import urllib.request
+import ssl
+
+# ==================== CONFIGURACIÓN ====================
+CONFIG_DIR = "/etc/shield_linux"
+LOG_PATH = "/var/log/ufw.log"
+AUTH_LOG_PATH = "/var/log/auth.log"
+SYSLOG_PATH = "/var/log/syslog"
+BAN_LOG_PATH = "/var/log/shield_bans.log"
+STATE_FILE = f"{CONFIG_DIR}/shield_state.json"
+WHITELIST_FILE = f"{CONFIG_DIR}/whitelist.json"
+BLACKLIST_FILE = f"{CONFIG_DIR}/blacklist.json"
+STATS_FILE = f"{CONFIG_DIR}/statistics.json"
+THREAT_INTEL_FILE = f"{CONFIG_DIR}/threat_intel.json"
+YARA_RULES_DIR = f"{CONFIG_DIR}/yara_rules"
+SIGMA_RULES_DIR = f"{CONFIG_DIR}/sigma_rules"
+# API keys rotativas de AbuseIPDB (se rotan automáticamente al alcanzar límite)
+ABUSEIPDB_API_KEYS = [
+    "445e7aea35654d655abda609f1312c3e07eabac64e0071904921335db8034e282dac16119b305295",
+    "cfac1a0744efd54c3493f4a9584ff893517e55d0423e85f010c2c0a5c9ddc27e70eaa47708e8c284"
+]
+ABUSEIPDB_CURRENT_KEY_INDEX = 0  # Índice de la key actual
+ABUSEIPDB_KEY_USAGE = {}  # Track de uso por IP: {ip: {"key_index": 0, "requests": 0, "last_reset": time}}
+
+THRESHOLD = 3
+BAN_TIME_DEFAULT = -1
+SCAN_THRESHOLD = 5
+DDOS_THRESHOLD = 50
+RATE_LIMIT_WINDOW = 60
+BRUTE_FORCE_WINDOW = 300
+BRUTE_FORCE_THRESHOLD = 10
+
+# Nuevas configuraciones EXTREME
+DNS_ANOMALY_THRESHOLD = 15
+NETWORK_SCAN_PORTS_COUNT = 10
+NETWORK_SCAN_TIME_WINDOW = 60
+PRIVILEGE_ESCALATION_KEYWORDS = ["sudo", "chown", "chmod", "root", "passwd"]
+COMMAND_INJECTION_PATTERNS = [r"\|\s*([^\s]+)", r"&&\s*([^\s]+)", r";\s*([^\s]+)", r"`([^`]+)`"]
+FILE_RENAME_THRESHOLD = 5
+RANSOMWARE_FILE_EXTENSIONS = [".crypt", ".lock", ".encrypted", ".aes", ".abc"]
+WORM_NETWORK_ACTIVITY_THRESHOLD = 100
+SUPICIOUS_PROCESS_KEYWORDS = ["nc ", "ncat ", "msfvenom", "powershell -enc", "mimikatz"]
+WEBSHELL_DETECTION_PATTERNS = [r"\<\?php.*\$_GET\[", r"\<\?php.*\$_POST\[", r"shell_exec", r"eval\("]
+DATA_EXFILTRATION_THRESHOLD_BYTES = 1024 * 1024 * 10
+
+# IPs que NUNCA deben banearse
+SYSTEM_WHITELIST = {
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+    "255.255.255.255"
+}
+
+# ==================== HONEYPOT DINÁMICO ====================
+class DynamicHoneypot:
+    """Gestiona puertos honeypot que atraen atacantes"""
+
+    def __init__(self):
+        self.honeypot_ports = {22, 23, 80, 443, 3306, 5432, 6379, 27017}  # Puertos comunes
+        self.interactions: Dict[str, List[Tuple[int, float]]] = defaultdict(list)  # IP -> [(port, timestamp)]
+        self.honeypot_threshold = 1  # Una interacción = ban inmediato
+
+    def register_interaction(self, ip: str, port: int) -> bool:
+        """Registra interacción con honeypot y retorna True si debe banearse"""
+        now = time.time()
+        self.interactions[ip].append((port, now))
+
+        # Limpiar interacciones viejas (> 5 minutos)
+        self.interactions[ip] = [(p, t) for p, t in self.interactions[ip] if now - t < 300]
+
+        if len(self.interactions[ip]) >= self.honeypot_threshold:
+            print(f"[🍯 HONEYPOT] {ip} interactuó con puertos trampa: {[p for p,t in self.interactions[ip]]}")
+            return True
+        return False
+
+    def add_honeypot_port(self, port: int):
+        """Agrega puerto honeypot"""
+        self.honeypot_ports.add(port)
+        print(f"[🍯 HONEYPOT] Puerto {port} añadido como trampa")
+
+# ==================== TCP SINKHOLE ====================
+class TCPSinkhole:
+    """Redirige tráfico malicioso a un agujero negro que consume recursos del atacante"""
+
+    def __init__(self):
+        self.sinkhole_ports = set()  # Puertos que actúan como sinkhole
+        self.connections_dropped = 0
+
+    def add_sinkhole_rule(self, ip: str, port: int) -> bool:
+        """Añade regla iptables para redirigir tráfico a sinkhole"""
+        try:
+            # REDIRECT a puerto inexistente = conexión colgada
+            subprocess.run(
+                ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", ip, "-p", "tcp", "--dport", str(port), "-j", "REDIRECT", "--to-port", "9999"],
+                check=True, capture_output=True
+            )
+            self.sinkhole_ports.add(port)
+            print(f"[🕳️ SINKHOLE] Tráfico de {ip}:{port} redirigido a agujero negro")
+            return True
+        except Exception as e:
+            print(f"[!] Error añadiendo sinkhole: {e}")
+            return False
+
+# ==================== CONNECTION RATE SHAPING ====================
+class ConnectionRateShaper:
+    """Limita conexiones por IP usando iptables hashlimit"""
+
+    def __init__(self):
+        self.rate_limits: Dict[str, Dict] = {}  # IP -> {limit, burst}
+
+    def set_rate_limit(self, ip: str, limit_per_sec: int = 10, burst: int = 20) -> bool:
+        """Establece límite de conexiones por segundo para una IP"""
+        try:
+            subprocess.run(
+                ["iptables", "-A", "INPUT", "-s", ip, "-m", "hashlimit",
+                 "--hashlimit-name", f"shield_{ip.replace('.', '_')}",
+                 "--hashlimit-mode", "srcip",
+                 "--hashlimit-upto", str(limit_per_sec),
+                 "--hashlimit-burst", str(burst),
+                 "-j", "ACCEPT"],
+                check=True, capture_output=True
+            )
+            # Paquetes por encima del límite = DROP
+            subprocess.run(
+                ["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"],
+                check=True, capture_output=True
+            )
+            self.rate_limits[ip] = {"limit": limit_per_sec, "burst": burst}
+            print(f"[⚡ RATE LIMIT] {ip}: {limit_per_sec}/sec, burst={burst}")
+            return True
+        except Exception as e:
+            print(f"[!] Error estableciendo rate limit: {e}")
+            return False
+
+# ==================== SYN COOKIE FORZADO ====================
+class SYNCookieDefense:
+    """Activa SYN cookies a nivel de kernel para mitigar SYN floods"""
+
+    @staticmethod
+    def enable_syn_cookies() -> bool:
+        """Activa SYN cookies en el kernel (silencioso si ya están activas)"""
+        try:
+            subprocess.run(["sysctl", "-w", "net.ipv4.tcp_syncookies=1"], check=False, capture_output=True)
+            subprocess.run(["sysctl", "-w", "net.ipv4.tcp_max_syn_backlog=2048"], check=False, capture_output=True)
+            subprocess.run(["sysctl", "-w", "net.ipv4.tcp_synack_retries=2"], check=False, capture_output=True)
+            # Verificar si están activas
+            result = subprocess.run(["sysctl", "-n", "net.ipv4.tcp_syncookies"], capture_output=True, text=True)
+            if result.stdout.strip() == "1":
+                print("[🍪 SYN COOKIES] Activados para mitigar SYN floods")
+                return True
+            else:
+                print("[ℹ️] SYN COOKIES: Ya están activas o no se pudo verificar")
+                return False
+        except Exception as e:
+            return False
+
+# ==================== THREAT INTELLIGENCE FEEDS ====================
+class ThreatIntelligenceFeed:
+    """Integra feeds de inteligencia de amenazas en tiempo real con rotación de API keys"""
+
+    def __init__(self):
+        self.abuseipdb_cache: Dict[str, Dict] = {}
+        self.spamhaus_drop: Set[str] = set()
+        self.last_feed_update = 0
+        self.feed_update_interval = 3600  # 1 hora
+        self.current_key_index = 0
+        self.key_usage = {i: {"requests": 0, "last_reset": time.time()} for i in range(len(ABUSEIPDB_API_KEYS))}
+        self.max_requests_per_key = 1000  # Límite de requests por key antes de rotar (ajustar según plan)
+        self.key_errors = {i: 0 for i in range(len(ABUSEIPDB_API_KEYS))}  # Contador de errores por key
+
+    def _get_current_api_key(self) -> str:
+        """Retorna la API key actual, rotando si es necesario"""
+        return ABUSEIPDB_API_KEYS[self.current_key_index]
+
+    def _rotate_key(self, reason: str = "límite alcanzado"):
+        """Rota a la siguiente API key disponible"""
+        old_index = self.current_key_index
+        attempts = 0
+        while attempts < len(ABUSEIPDB_API_KEYS):
+            self.current_key_index = (self.current_key_index + 1) % len(ABUSEIPDB_API_KEYS)
+            # Verificar si la key tiene errores consecutivos (skip si > 5 errores)
+            if self.key_errors.get(self.current_key_index, 0) < 5:
+                print(f"[🔄 ABUSEIPDB] Rotación de API key: {old_index} → {self.current_key_index} ({reason})")
+                # Resetear contador de requests para la nueva key
+                self.key_usage[self.current_key_index]["requests"] = 0
+                self.key_usage[self.current_key_index]["last_reset"] = time.time()
+                return
+            attempts += 1
+        # Si todas las keys tienen errores, usar la siguiente de todas formas
+        print(f"[⚠️ ABUSEIPDB] Todas las API keys tienen errores, usando key {self.current_key_index}")
+
+    def _check_and_rotate_key(self):
+        """Verifica si es necesario rotar la key por límite de requests"""
+        now = time.time()
+        key_info = self.key_usage[self.current_key_index]
+
+        # Resetear contador cada hora
+        if now - key_info["last_reset"] > 3600:
+            key_info["requests"] = 0
+            key_info["last_reset"] = now
+
+        # Rotar si alcanza el límite
+        if key_info["requests"] >= self.max_requests_per_key:
+            self._rotate_key("límite de requests")
+
+    def check_abuseipdb(self, ip: str) -> Dict:
+        """Consulta AbuseIPDB API para verificar reputación de IP con rotación automática de keys"""
+        if not ABUSEIPDB_API_KEYS:
+            return {"is_malicious": False, "reason": "No API key configurada"}
+
+        if ip in self.abuseipdb_cache:
+            return self.abuseipdb_cache[ip]
+
+        # Verificar si necesita rotación antes de hacer request
+        self._check_and_rotate_key()
+
+        max_retries = len(ABUSEIPDB_API_KEYS)  # Intentar con todas las keys
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                api_key = self._get_current_api_key()
+                req = urllib.request.Request(
+                    f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}",
+                    headers={"Key": api_key, "Accept": "application/json"}
+                )
+                context = ssl.create_default_context()
+                with urllib.request.urlopen(req, context=context, timeout=5) as response:
+                    data = json.loads(response.read().decode())
+                    result = data.get("data", {})
+
+                    # Si abuseScore > 50, es maliciosa
+                    is_malicious = result.get("abuseConfidenceScore", 0) > 50
+
+                    self.abuseipdb_cache[ip] = {
+                        "is_malicious": is_malicious,
+                        "score": result.get("abuseConfidenceScore", 0),
+                        "reports": result.get("totalReports", 0),
+                        "last_reported": result.get("lastReportedAt")
+                    }
+
+                    # Actualizar contador de uso de la key
+                    self.key_usage[self.current_key_index]["requests"] += 1
+
+                    # Resetear contador de errores si tuvo éxito
+                    self.key_errors[self.current_key_index] = 0
+
+                    if is_malicious:
+                        print(f"[🌐 ABUSEIPDB] {ip} es MALICIOSA (score: {self.abuseipdb_cache[ip]['score']}%) - Key: {self.current_key_index + 1}/{len(ABUSEIPDB_API_KEYS)}")
+
+                    return self.abuseipdb_cache[ip]
+
+            except urllib.error.HTTPError as e:
+                last_error = str(e)
+                self.key_errors[self.current_key_index] += 1
+                print(f"[⚠️ ABUSEIPDB] Error HTTP con key {self.current_key_index + 1}: {e.code} - {e.reason}")
+
+                # Si es 429 (Too Many Requests) o 403 (Forbidden), rotar inmediatamente
+                if hasattr(e, 'code') and e.code in [429, 403]:
+                    self._rotate_key(f"error HTTP {e.code}")
+                    continue
+                else:
+                    break  # Otros errores no requieren rotación
+
+            except Exception as e:
+                last_error = str(e)
+                self.key_errors[self.current_key_index] += 1
+                print(f"[⚠️ ABUSEIPDB] Error con key {self.current_key_index + 1}: {e}")
+                # Rotar y intentar con la siguiente key
+                self._rotate_key("error de conexión")
+                continue
+
+        # Si llegamos aquí, todas las keys fallaron
+        print(f"[❌ ABUSEIPDB] Todas las API keys fallaron para {ip}. Último error: {last_error}")
+        return {"is_malicious": False, "reason": f"Error en todas las keys: {last_error}"}
+
+    def update_spamhaus_drop(self) -> Set[str]:
+        """Descarga lista DROP de Spamhaus (IPs de botnets confirmadas)"""
+        try:
+            req = urllib.request.Request("https://www.spamhaus.org/drop/drop.txt")
+            with urllib.request.urlopen(req, timeout=10) as response:
+                content = response.read().decode()
+                self.spamhaus_drop = set()
+                for line in content.split('\n'):
+                    if line and not line.startswith(';') and '/' in line:
+                        cidr = line.split(';')[0].strip()
+                        self.spamhaus_drop.add(cidr)
+                print(f"[🌐 SPAMHAUS] {len(self.spamhaus_drop)} redes DROP cargadas")
+                return self.spamhaus_drop
+        except Exception as e:
+            print(f"[!] Error actualizando Spamhaus: {e}")
+            return set()
+
+    def check_spamhaus_drop(self, ip: str) -> bool:
+        """Verifica si IP está en lista Spamhaus DROP"""
+        if not self.spamhaus_drop:
+            self.update_spamhaus_drop()
+
+        # Verificar si IP está en algún CIDR de Spamhaus
+        for cidr in self.spamhaus_drop:
+            try:
+                import ipaddress
+                if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False):
+                    print(f"[🌐 SPAMHAUS] {ip} está en lista DROP (botnet confirmada)")
+                    return True
+            except:
+                pass
+        return False
+
+# ==================== BAN EN CASCADA ====================
+class CascadeBanManager:
+    """Banea rangos completos de IP cuando detecta ataques coordinados"""
+
+    def __init__(self):
+        self.attack_patterns: Dict[str, List[Tuple[str, float]]] = defaultdict(list)  # subnet -> [(ip, timestamp)]
+        self.cascade_threshold = 3  # IPs de misma subnet = banear /24
+        self.banned_subnets: Set[str] = set()
+
+    def register_attack(self, ip: str) -> Optional[str]:
+        """Registra ataque y retorna subnet a banear si se alcanza el threshold"""
+        now = time.time()
+
+        # Obtener /24 subnet
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return None
+        subnet_24 = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+        subnet_16 = f"{parts[0]}.{parts[1]}.0.0/16"
+
+        # Registrar ataque
+        self.attack_patterns[subnet_24].append((ip, now))
+
+        # Limpiar ataques viejos (> 10 minutos)
+        self.attack_patterns[subnet_24] = [(i, t) for i, t in self.attack_patterns[subnet_24] if now - t < 600]
+
+        # Verificar si alcanzó threshold para ban en cascada
+        unique_ips = set(ip for ip, _ in self.attack_patterns[subnet_24])
+
+        if len(unique_ips) >= self.cascade_threshold and subnet_24 not in self.banned_subnets:
+            self.banned_subnets.add(subnet_24)
+            print(f"[⚠️ CASCADE BAN] {len(unique_ips)} IPs de {subnet_24} atacando → BANEANDO SUBNET COMPLETA")
+            return subnet_24
+
+        return None
+
+# ==================== TARPITTING ====================
+class TarpitDefense:
+    """Retiene conexiones de atacantes por minutos para consumir sus recursos"""
+
+    def __init__(self):
+        self.tarpit_ips: Set[str] = set()
+
+    def add_tarpit(self, ip: str, port: int = 0) -> bool:
+        """Añade IP a tarpit (iptables TARPIT target)"""
+        try:
+            if port:
+                cmd = ["iptables", "-A", "INPUT", "-s", ip, "-p", "tcp", "--dport", str(port), "-j", "TARPIT"]
+            else:
+                cmd = ["iptables", "-A", "INPUT", "-s", ip, "-j", "TARPIT"]
+
+            subprocess.run(cmd, check=True, capture_output=True)
+            self.tarpit_ips.add(ip)
+            print(f"[🪤 TARPIT] {ip} atrapado - conexión retenida indefinidamente")
+            return True
+        except Exception as e:
+            # TARPIT requiere módulo xt_TARPIT
+            print(f"[!] TARPIT no disponible, usando DROP en su lugar: {e}")
+            return self.add_drop(ip, port)
+
+    def add_drop(self, ip: str, port: int = 0) -> bool:
+        """Fallback: DROP simple si TARPIT no está disponible"""
+        try:
+            if port:
+                cmd = ["iptables", "-A", "INPUT", "-s", ip, "-p", "tcp", "--dport", str(port), "-j", "DROP"]
+            else:
+                cmd = ["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"]
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"[🚫 DROP] {ip} bloqueado completamente")
+            return True
+        except Exception as e:
+            print(f"[!] Error añadiendo DROP: {e}")
+            return False
+
+# ==================== YARA RULES ENGINE ====================
+class YaraRulesEngine:
+    """Detecta malware conocido en logs y tráfico usando reglas YARA"""
+
+    def __init__(self):
+        self.rules = []
+        self.load_default_rules()
+
+    def load_default_rules(self):
+        """Carga reglas YARA por defecto para detección de malware"""
+        # Reglas simplificadas basadas en patrones de texto
+        self.rules = [
+            {"name": "Shellcode_Pattern", "pattern": r"\\x[0-9a-fA-F]{2}"},
+            {"name": "Base64_Exec", "pattern": r"(eval|exec)\s*\(\s*base64"},
+            {"name": "Powershell_Encoded", "pattern": r"powershell.*(-enc|-encodedcommand)"},
+            {"name": "Reverse_Shell", "pattern": r"(bash|sh|nc)\s+-i\s+.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"},
+            {"name": "Meterpreter_Pattern", "pattern": r"meterpreter|payload\.php|c99shell"},
+            {"name": "Crypto_Miner", "pattern": r"(stratum\+tcp|cryptonight|monero|xmrig)"},
+            {"name": "SQL_Injection", "pattern": r"(UNION\s+SELECT|OR\s+1\s*=\s*1|DROP\s+TABLE)"},
+            {"name": "XSS_Attack", "pattern": r"<script[^>]*>.*</script>"},
+        ]
+        print(f"[🦠 YARA] {len(self.rules)} reglas cargadas")
+
+    def scan_log(self, log_line: str) -> List[str]:
+        """Escanea línea de log en busca de patrones YARA"""
+        matches = []
+        for rule in self.rules:
+            if re.search(rule["pattern"], log_line, re.IGNORECASE):
+                matches.append(rule["name"])
+                print(f"[🦠 YARA MATCH] {rule['name']} detectado en log")
+        return matches
+
+# ==================== SIGMA RULES ENGINE (MITRE ATT&CK) ====================
+class SigmaRulesEngine:
+    """Detecta técnicas MITRE ATT&CK usando reglas Sigma simplificadas"""
+
+    def __init__(self):
+        self.sigma_rules = []
+        self.load_mitre_rules()
+
+    def load_mitre_rules(self):
+        """Carga reglas Sigma para técnicas MITRE ATT&CK comunes"""
+        self.sigma_rules = [
+            {
+                "name": "T1110_Brute_Force",
+                "mitre_id": "T1110",
+                "pattern": r"(Failed password|authentication failure|FAILED LOGIN)",
+                "severity": "high"
+            },
+            {
+                "name": "T1078_Valid_Accounts",
+                "mitre_id": "T1078",
+                "pattern": r"(Accepted password|session opened|Successful login)",
+                "severity": "medium"
+            },
+            {
+                "name": "T1068_Exploitation",
+                "mitre_id": "T1068",
+                "pattern": r"(privilege escalation|sudo.*FAILED|unauthorized)",
+                "severity": "critical"
+            },
+            {
+                "name": "T1059_Command_Execution",
+                "mitre_id": "T1059",
+                "pattern": r"(COMMAND=|execve|bash -c|sh -c)",
+                "severity": "high"
+            },
+            {
+                "name": "T1046_Network_Scanning",
+                "mitre_id": "T1046",
+                "pattern": r"(port scan|nmap|masscan|SYN)",
+                "severity": "high"
+            },
+            {
+                "name": "T1071_App_Layer_Protocol",
+                "mitre_id": "T1071",
+                "pattern": r"(HTTP POST|DNS query|C2 beacon)",
+                "severity": "medium"
+            },
+        ]
+        print(f"[📋 SIGMA] {len(self.sigma_rules)} reglas MITRE ATT&CK cargadas")
+
+    def scan_log(self, log_line: str) -> List[Dict]:
+        """Escanea log buscando técnicas MITRE ATT&CK"""
+        matches = []
+        for rule in self.sigma_rules:
+            if re.search(rule["pattern"], log_line, re.IGNORECASE):
+                matches.append({
+                    "technique": rule["name"],
+                    "mitre_id": rule["mitre_id"],
+                    "severity": rule["severity"]
+                })
+                print(f"[📋 MITRE ATT&CK] {rule['name']} ({rule['mitre_id']}) detectado - Severidad: {rule['severity']}")
+        return matches
+
+# ==================== LOG CORRELATION ENGINE ====================
+class LogCorrelationEngine:
+    """Cruza logs de UFW, auth.log, syslog para detectar ataques complejos"""
+
+    def __init__(self):
+        self.auth_log_cache: Deque[Tuple[str, str, float]] = deque(maxlen=1000)  # (IP, event, timestamp)
+        self.ufw_log_cache: Deque[Tuple[str, int, float]] = deque(maxlen=1000)  # (IP, port, timestamp)
+        self.correlation_window = 300  # 5 minutos
+
+    def add_auth_event(self, ip: str, event: str):
+        """Agrega evento de auth.log"""
+        self.auth_log_cache.append((ip, event, time.time()))
+
+    def add_ufw_event(self, ip: str, port: int):
+        """Agrega evento de UFW"""
+        self.ufw_log_cache.append((ip, port, time.time()))
+
+    def correlate_attack(self, ip: str) -> Dict:
+        """Correlaciona eventos para detectar ataques complejos"""
+        now = time.time()
+        result = {
+            "is_coordinated": False,
+            "attack_type": None,
+            "confidence": 0.0,
+            "evidence": []
+        }
+
+        # Contar eventos recientes de esta IP
+        auth_events = [(e, t) for e, t in [(ev, ts) for ip2, ev, ts in self.auth_log_cache if ip2 == ip and now - ts < self.correlation_window]]
+        ufw_events = [(p, t) for p, t in [(pt, ts) for ip2, pt, ts in self.ufw_log_cache if ip2 == ip and now - ts < self.correlation_window]]
+
+        # Detectar ataque combinado: firewall + auth
+        if len(auth_events) >= 3 and len(ufw_events) >= 5:
+            result["is_coordinated"] = True
+            result["attack_type"] = "Multi-Vector Attack (Firewall + Auth)"
+            result["confidence"] = 0.9
+            result["evidence"] = [f"{len(auth_events)} eventos auth", f"{len(ufw_events)} eventos firewall"]
+            print(f"[🔗 CORRELATION] Ataque coordinado detectado desde {ip}: {result['attack_type']}")
+
+        # Detectar reconnaissance seguido de explotación
+        elif len(ufw_events) >= 10:
+            ports_scanned = set(p for p, _ in ufw_events)
+            if len(ports_scanned) >= 5:
+                result["is_coordinated"] = True
+                result["attack_type"] = "Reconnaissance → Exploitation"
+                result["confidence"] = 0.7
+                result["evidence"] = [f"{len(ports_scanned)} puertos scaneados"]
+                print(f"[🔗 CORRELATION] Reconocimiento seguido de explotación desde {ip}")
+
+        return result
+
+    def monitor_auth_log(self):
+        """Monitorea auth.log en busca de eventos relevantes"""
+        try:
+            if not os.path.exists(AUTH_LOG_PATH):
+                return
+
+            with open(AUTH_LOG_PATH, 'r') as f:
+                f.seek(0, 2)  # Fin del archivo
+                while True:
+                    line = f.readline()
+                    if not line:
+                        time.sleep(1)
+                        continue
+
+                    # Extraer IP de líneas de auth
+                    ip_match = re.search(r"from\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
+                    if ip_match:
+                        ip = ip_match.group(1)
+                        event = "unknown"
+                        if "Failed password" in line:
+                            event = "failed_login"
+                        elif "Accepted password" in line:
+                            event = "successful_login"
+                        elif "Invalid user" in line:
+                            event = "invalid_user"
+
+                        self.add_auth_event(ip, event)
+        except Exception as e:
+            print(f"[!] Error monitoreando auth.log: {e}")
+
+# ==================== 15 FUNCIONES EXTREME ADICIONALES ====================
+
+# Función 1: IP Reputation Scoring (Sistema de reputación local)
+class IPReputationSystem:
+    """Sistema de reputación de IPs basado en comportamiento histórico"""
+
+    def __init__(self):
+        self.reputation_scores: Dict[str, float] = {}  # IP -> score (0-100)
+        self.behavior_log: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        self.ban_threshold = 75  # Score > 75 = banear
+
+    def add_behavior(self, ip: str, behavior: str):
+        """Registra comportamiento y actualiza score"""
+        now = time.time()
+        self.behavior_log[ip].append((behavior, now))
+
+        # Limpiar behaviors viejos (> 1 hora)
+        self.behavior_log[ip] = [(b, t) for b, t in self.behavior_log[ip] if now - t < 3600]
+
+        # Calcular score basado en behaviors
+        score = 0
+        for behavior, _ in self.behavior_log[ip]:
+            if "scan" in behavior.lower():
+                score += 10
+            elif "brute" in behavior.lower():
+                score += 20
+            elif "flood" in behavior.lower():
+                score += 30
+            elif "malware" in behavior.lower():
+                score += 50
+            else:
+                score += 5
+
+        self.reputation_scores[ip] = min(score, 100)
+
+        if self.reputation_scores[ip] >= self.ban_threshold:
+            print(f"[📊 REPUTATION] {ip} tiene score {self.reputation_scores[ip]} → BAN RECOMENDADO")
+            return True
+        return False
+
+    def get_reputation(self, ip: str) -> float:
+        """Obtiene score de reputación"""
+        return self.reputation_scores.get(ip, 0)
+
+# Función 2: Port Knocking Detection
+class PortKnockingDetector:
+    """Detecta intentos de port knocking (secuencia de puertos)"""
+
+    def __init__(self):
+        self.port_sequences: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
+        self.knock_threshold = 5  # 5+ puertos en secuencia = sospechoso
+
+    def register_port(self, ip: str, port: int) -> bool:
+        """Registra puerto tocado y detecta secuencias"""
+        now = time.time()
+        self.port_sequences[ip].append((port, now))
+
+        # Limpiar puertos viejos (> 30 segundos)
+        self.port_sequences[ip] = [(p, t) for p, t in self.port_sequences[ip] if now - t < 30]
+
+        # Detectar secuencia de port knocking
+        if len(self.port_sequences[ip]) >= self.knock_threshold:
+            ports = [p for p, _ in self.port_sequences[ip]]
+            print(f"[🚪 PORT KNOCKING] {ip} tocó secuencia: {ports}")
+            return True
+        return False
+
+# Función 3: DNS Tunneling Detection
+class DNSTunnelingDetector:
+    """Detecta exfiltración de datos vía DNS"""
+
+    def __init__(self):
+        self.dns_queries: Dict[str, int] = defaultdict(int)
+        self.query_threshold = 100  # 100 queries DNS/minuto = sospechoso
+
+    def register_query(self, ip: str) -> bool:
+        """Registra query DNS y detecta tunneling"""
+        self.dns_queries[ip] += 1
+
+        if self.dns_queries[ip] >= self.query_threshold:
+            print(f"[🌐 DNS TUNNELING] {ip} hizo {self.dns_queries[ip]} queries DNS → Posible exfiltración")
+            return True
+        return False
+
+    def reset_counters(self):
+        """Reseta contadores cada minuto"""
+        self.dns_queries.clear()
+
+# Función 4: ICMP Flood Protection
+class ICMPFloodProtector:
+    """Protege contra ping floods"""
+
+    def __init__(self):
+        self.icmp_count: Dict[str, int] = defaultdict(int)
+        self.icmp_threshold = 50  # 50 ICMP/segundo = flood
+
+    def register_icmp(self, ip: str) -> bool:
+        """Registra paquete ICMP y detecta flood"""
+        self.icmp_count[ip] += 1
+
+        if self.icmp_count[ip] >= self.icmp_threshold:
+            print(f"[❄️ ICMP FLOOD] {ip} envió {self.icmp_count[ip]} pings → BANEANDO")
+            return True
+        return False
+
+    def reset_counters(self):
+        """Reseta contadores cada segundo"""
+        self.icmp_count.clear()
+
+# Función 5: UDP Flood Protection
+class UDPFloodProtector:
+    """Protege contra UDP floods"""
+
+    def __init__(self):
+        self.udp_count: Dict[str, int] = defaultdict(int)
+        self.udp_threshold = 100  # 100 UDP/segundo = flood
+
+    def register_udp(self, ip: str) -> bool:
+        """Registra paquete UDP y detecta flood"""
+        self.udp_count[ip] += 1
+
+        if self.udp_count[ip] >= self.udp_threshold:
+            print(f"[📡 UDP FLOOD] {ip} envió {self.udp_count[ip]} paquetes → BANEANDO")
+            return True
+        return False
+
+    def reset_counters(self):
+        self.udp_count.clear()
+
+# Función 6: HTTP Flood Detection (Layer 7 DDoS)
+class HTTPFloodDetector:
+    """Detecta HTTP floods (ataques Layer 7)"""
+
+    def __init__(self):
+        self.http_requests: Dict[str, List[float]] = defaultdict(list)
+        self.http_threshold = 100  # 100 requests/segundo = flood
+
+    def register_request(self, ip: str) -> bool:
+        """Registra request HTTP y detecta flood"""
+        now = time.time()
+        self.http_requests[ip].append(now)
+
+        # Limpiar requests viejos (> 1 segundo)
+        self.http_requests[ip] = [t for t in self.http_requests[ip] if now - t < 1]
+
+        if len(self.http_requests[ip]) >= self.http_threshold:
+            print(f"[🌐 HTTP FLOOD] {ip} hizo {len(self.http_requests[ip])} requests/seg → BANEANDO")
+            return True
+        return False
+
+# Función 7: SSH Honeypot (Fake SSH Service)
+class SSHHoneypot:
+    """Simula servicio SSH para atraer atacantes"""
+
+    def __init__(self):
+        self.fake_banners = [
+            "SSH-2.0-OpenSSH_7.4p1 Ubuntu-10",
+            "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4",
+            "SSH-2.0-OpenSSH_6.6.1p1"
+        ]
+        self.attacks_logged: Dict[str, List[str]] = defaultdict(list)
+
+    def get_fake_banner(self) -> str:
+        """Retorna banner SSH falso aleatorio"""
+        return random.choice(self.fake_banners)
+
+    def log_attack(self, ip: str, username: str, password: str):
+        """Registra intento de brute force SSH"""
+        self.attacks_logged[ip].append(f"{username}:{password}")
+        print(f"[🍯 SSH HONEYPOT] {ip} intentó login: {username}:{password}")
+
+# Función 8: GeoIP Blocking (Bloqueo por país)
+class GeoIPBlocker:
+    """Bloquea países completos usando rangos IP de iptables"""
+
+    def __init__(self):
+        self.blocked_countries: Set[str] = set()  # Códigos ISO de países bloqueados
+        self.ip_to_country: Dict[str, str] = {}  # Cache local
+        # Rangos IP de Corea del Norte (aproximados - pocos rangos conocidos)
+        self.north_korea_ranges = [
+            "175.45.176.0/22",
+            "175.45.180.0/24",
+            "210.52.109.0/24",
+            "77.94.35.0/24"
+        ]
+        # Rangos IP de China (principales bloques - lista parcial, se puede expandir)
+        # China tiene miles de rangos, estos son los principales bloques /8 y /16
+        self.china_ranges = [
+            "1.0.1.0/24", "1.0.2.0/23", "1.0.8.0/21", "1.0.32.0/19",
+            "1.1.0.0/24", "1.1.2.0/23", "1.1.4.0/22", "1.1.8.0/21",
+            "1.1.16.0/20", "1.1.32.0/19", "1.1.64.0/18", "1.2.0.0/23",
+            "1.2.2.0/24", "1.2.4.0/22", "1.2.8.0/21", "1.2.16.0/20",
+            "1.2.32.0/19", "1.2.64.0/18", "1.2.128.0/17",
+            "1.3.0.0/16", "1.4.0.0/14", "1.8.0.0/13", "1.24.0.0/13",
+            "1.45.0.0/16", "1.48.0.0/15", "1.50.0.0/15", "1.52.0.0/14",
+            "1.56.0.0/13", "1.68.0.0/14", "1.80.0.0/12", "1.116.0.0/14",
+            "1.180.0.0/14", "1.184.0.0/15", "1.188.0.0/14", "1.192.0.0/13",
+            "14.0.12.0/22", "14.0.16.0/20", "14.1.0.0/16", "14.16.0.0/12",
+            "14.102.0.0/15", "14.104.0.0/13", "14.112.0.0/12", "14.128.0.0/11",
+            "14.192.0.0/12", "14.208.0.0/12", "27.0.128.0/17", "27.8.0.0/13",
+            "27.16.0.0/12", "27.36.0.0/14", "27.40.0.0/13", "27.50.40.0/21",
+            "27.50.128.0/17", "27.54.192.0/18", "27.98.208.0/20", "27.99.128.0/17",
+            "27.100.36.0/22", "27.106.128.0/18", "27.112.0.0/20", "27.112.80.0/20",
+            "27.115.0.0/17", "27.128.0.0/15", "27.131.220.0/22", "27.148.0.0/14",
+            "27.152.0.0/13", "27.184.0.0/13", "27.192.0.0/10",
+            "36.0.8.0/21", "36.0.32.0/19", "36.1.0.0/16", "36.4.0.0/14",
+            "36.16.0.0/12", "36.32.0.0/14", "36.40.0.0/13", "36.48.0.0/15",
+            "36.56.0.0/13", "36.96.0.0/11", "36.128.0.0/10",
+            "39.64.0.0/11", "39.96.0.0/13", "39.128.0.0/10",
+            "42.0.0.0/11", "42.48.0.0/13", "42.56.0.0/15", "42.80.0.0/12",
+            "42.96.0.0/11", "42.128.0.0/12", "42.176.0.0/12", "42.192.0.0/11",
+            "42.224.0.0/12", "42.240.0.0/13",
+            "49.0.0.0/13", "49.52.0.0/14", "49.64.0.0/11", "49.112.0.0/13",
+            "49.128.0.0/11", "49.208.0.0/13", "49.216.0.0/15", "49.220.0.0/14",
+            "49.232.0.0/14", "49.240.0.0/13",
+            "58.14.0.0/15", "58.16.0.0/15", "58.18.0.0/16", "58.20.0.0/14",
+            "58.24.0.0/15", "58.30.0.0/15", "58.32.0.0/11", "58.66.0.0/15",
+            "58.68.128.0/17", "58.82.0.0/15", "58.87.64.0/18", "58.99.128.0/17",
+            "58.100.0.0/15", "58.116.0.0/14", "58.128.0.0/13", "58.144.0.0/12",
+            "58.192.0.0/11", "58.240.0.0/13", "58.248.0.0/15",
+            "59.32.0.0/12", "59.48.0.0/15", "59.50.0.0/16", "59.51.0.0/17",
+            "59.56.0.0/13", "59.64.0.0/12", "59.80.0.0/15", "59.108.0.0/14",
+            "59.151.0.0/16", "59.155.0.0/16", "59.172.0.0/14", "59.191.0.0/16",
+            "59.192.0.0/10",
+            "60.0.0.0/13", "60.8.0.0/15", "60.10.0.0/16", "60.12.0.0/16",
+            "60.13.0.0/17", "60.18.0.0/15", "60.28.0.0/14", "60.55.0.0/16",
+            "60.63.0.0/16", "60.160.0.0/11", "60.194.0.0/15", "60.200.0.0/13",
+            "60.208.0.0/13", "60.216.0.0/14", "60.220.0.0/14", "60.232.0.0/13",
+            "60.245.128.0/17", "60.247.0.0/16", "60.252.0.0/16", "60.253.0.0/17",
+            "60.255.0.0/16",
+            "61.4.64.0/20", "61.4.80.0/21", "61.8.160.0/19", "61.28.0.0/14",
+            "61.45.128.0/18", "61.47.128.0/18", "61.48.0.0/13", "61.87.192.0/18",
+            "61.128.0.0/10", "61.232.0.0/14", "61.236.0.0/15", "61.240.0.0/12",
+            "101.0.0.0/22", "101.1.0.0/16", "101.4.0.0/14", "101.16.0.0/12",
+            "101.32.0.0/11", "101.64.0.0/13", "101.72.0.0/15", "101.76.0.0/14",
+            "101.80.0.0/12", "101.96.0.0/13", "101.110.0.0/15", "101.128.0.0/11",
+            "101.192.0.0/11", "101.224.0.0/13", "101.232.0.0/14", "101.248.0.0/15",
+            "103.0.0.0/15", "103.7.28.0/22", "103.9.156.0/22", "103.10.60.0/22",
+            "103.12.160.0/22", "103.14.34.0/23", "103.15.200.0/22", "103.16.60.0/22",
+            "103.18.220.0/22", "103.192.0.0/14", "103.196.0.0/15", "103.224.0.0/14",
+            "106.0.0.0/11", "106.32.0.0/12", "106.48.0.0/15", "106.80.0.0/12",
+            "110.0.0.0/11", "110.64.0.0/11", "110.96.0.0/11", "110.128.0.0/11",
+            "110.160.0.0/12", "110.184.0.0/13", "110.192.0.0/11", "110.224.0.0/12",
+            "111.0.0.0/10", "111.64.0.0/11", "111.112.0.0/12", "111.128.0.0/11",
+            "111.160.0.0/13", "111.172.0.0/14", "111.176.0.0/12", "111.192.0.0/12",
+            "111.224.0.0/11",
+            "112.0.0.0/10", "112.64.0.0/14", "112.72.0.0/13", "112.80.0.0/12",
+            "112.96.0.0/13", "112.104.0.0/14", "112.112.0.0/12", "112.128.0.0/12",
+            "112.192.0.0/11", "112.224.0.0/11", "112.256.0.0/12",
+            "113.0.0.0/11", "113.64.0.0/10", "113.128.0.0/15", "113.136.0.0/13",
+            "113.200.0.0/15", "113.204.0.0/14", "113.208.0.0/12", "113.224.0.0/12",
+            "113.240.0.0/13", "113.248.0.0/14",
+            "114.28.0.0/15", "114.54.0.0/15", "114.60.0.0/14", "114.64.0.0/12",
+            "114.80.0.0/15", "114.96.0.0/13", "114.104.0.0/14", "114.112.0.0/14",
+            "114.116.0.0/15", "114.128.0.0/12", "114.192.0.0/14", "114.196.0.0/15",
+            "114.200.0.0/13", "114.216.0.0/13", "114.224.0.0/11",
+            "115.24.0.0/14", "115.28.0.0/15", "115.32.0.0/12", "115.48.0.0/13",
+            "115.56.0.0/15", "115.60.0.0/14", "115.84.0.0/14", "115.96.0.0/11",
+            "115.148.0.0/14", "115.152.0.0/15", "115.156.0.0/14", "115.168.0.0/14",
+            "115.192.0.0/10",
+            "116.0.8.0/21", "116.1.0.0/16", "116.2.0.0/15", "116.4.0.0/14",
+            "116.8.0.0/14", "116.13.0.0/16", "116.16.0.0/12", "116.52.0.0/14",
+            "116.56.0.0/13", "116.66.0.0/15", "116.68.0.0/14", "116.89.144.0/20",
+            "116.90.184.0/21", "116.95.0.0/16", "116.112.0.0/14", "116.116.0.0/15",
+            "116.128.0.0/10", "116.192.0.0/14", "116.196.0.0/15", "116.198.0.0/16",
+            "116.199.0.0/17", "116.204.0.0/15", "116.206.0.0/16", "116.208.0.0/14",
+            "116.224.0.0/12", "116.242.0.0/15", "116.244.0.0/15", "116.246.0.0/16",
+            "116.248.0.0/13", "116.254.0.0/16", "116.255.240.0/20",
+            "117.8.0.0/13", "117.21.0.0/16", "117.22.0.0/15", "117.24.0.0/13",
+            "117.32.0.0/13", "117.40.0.0/13", "117.48.0.0/15", "117.50.0.0/16",
+            "117.51.128.0/17", "117.53.64.0/18", "117.57.0.0/16", "117.58.0.0/15",
+            "117.60.0.0/14", "117.64.0.0/13", "117.72.0.0/13", "117.80.0.0/12",
+            "117.100.0.0/15", "117.103.16.0/20", "117.120.64.0/18", "117.120.128.0/17",
+            "117.121.0.0/16", "117.128.0.0/10", "117.192.0.0/11", "117.232.0.0/13",
+            "117.240.0.0/12",
+            "118.24.0.0/15", "118.26.0.0/16", "118.28.0.0/15", "118.64.0.0/11",
+            "118.112.0.0/13", "118.120.0.0/14", "118.124.0.0/15", "118.126.0.0/16",
+            "118.132.0.0/14", "118.144.0.0/12", "118.178.0.0/16", "118.180.0.0/14",
+            "118.184.0.0/13", "118.192.0.0/11", "118.224.0.0/13", "118.232.0.0/14",
+            "118.239.0.0/16", "118.240.0.0/13", "118.248.0.0/14",
+            "119.0.0.0/13", "119.8.0.0/15", "119.16.0.0/12", "119.32.0.0/15",
+            "119.36.0.0/14", "119.40.0.0/13", "119.48.0.0/13", "119.57.0.0/16",
+            "119.58.0.0/15", "119.60.0.0/14", "119.75.208.0/20", "119.78.0.0/15",
+            "119.80.0.0/12", "119.96.0.0/13", "119.108.0.0/14", "119.112.0.0/13",
+            "119.128.0.0/12", "119.144.0.0/14", "119.161.128.0/18", "119.162.0.0/15",
+            "119.164.0.0/14", "119.176.0.0/12", "119.232.0.0/14", "119.248.0.0/15",
+            "119.253.0.0/16", "119.254.0.0/15",
+            "120.0.0.0/10", "120.64.0.0/13", "120.72.0.0/15", "120.76.0.0/14",
+            "120.80.0.0/13", "120.88.0.0/14", "120.92.0.0/16", "120.128.0.0/12",
+            "120.192.0.0/10",
+            "121.0.16.0/20", "121.4.0.0/14", "121.8.0.0/13", "121.16.0.0/12",
+            "121.32.0.0/14", "121.36.0.0/15", "121.40.0.0/13", "121.48.0.0/15",
+            "121.52.192.0/18", "121.55.0.0/16", "121.56.0.0/15", "121.58.0.0/16",
+            "121.59.0.0/17", "121.60.0.0/14", "121.68.0.0/14", "121.76.0.0/15",
+            "121.89.0.0/16", "121.100.128.0/17", "121.192.0.0/13", "121.201.0.0/16",
+            "121.204.0.0/14", "121.224.0.0/12", "121.248.0.0/13",
+            "122.0.64.0/18", "122.4.0.0/14", "122.48.0.0/16", "122.49.0.0/16",
+            "122.51.0.0/16", "122.64.0.0/11", "122.96.0.0/13", "122.112.0.0/12",
+            "122.136.0.0/13", "122.144.128.0/17", "122.152.192.0/18", "122.192.0.0/14",
+            "122.198.0.0/15", "122.200.192.0/18", "122.204.0.0/14", "122.224.0.0/12",
+            "122.240.0.0/13", "123.0.128.0/17", "123.4.0.0/14", "123.8.0.0/13",
+            "123.49.128.0/17", "123.52.0.0/14", "123.56.0.0/13", "123.64.0.0/11",
+            "123.96.0.0/13", "123.108.128.0/17", "123.112.0.0/12", "123.128.0.0/13",
+            "123.136.80.0/20", "123.137.0.0/16", "123.138.0.0/15", "123.144.0.0/12",
+            "123.160.0.0/14", "123.176.80.0/20", "123.177.0.0/16", "123.178.0.0/15",
+            "123.180.0.0/14", "123.184.0.0/13", "123.196.0.0/15", "123.199.128.0/17",
+            "123.206.0.0/15", "123.232.0.0/14", "123.242.0.0/15", "123.244.0.0/14",
+            "123.249.0.0/16", "123.253.0.0/16",
+            "124.6.64.0/18", "124.14.0.0/15", "124.16.0.0/12", "124.40.112.0/20",
+            "124.40.128.0/17", "124.42.0.0/16", "124.47.0.0/16", "124.64.0.0/11",
+            "124.112.0.0/13", "124.126.0.0/15", "124.128.0.0/12", "124.152.0.0/13",
+            "124.160.0.0/12", "124.192.0.0/14", "124.196.0.0/15", "124.200.0.0/13",
+            "124.220.0.0/14", "124.224.0.0/12", "124.240.0.0/13", "124.248.0.0/14",
+            "125.31.192.0/18", "125.32.0.0/12", "125.58.128.0/17", "125.64.0.0/11",
+            "125.96.0.0/13", "125.104.0.0/13", "125.112.0.0/12", "125.160.0.0/12",
+            "125.208.0.0/12", "125.224.0.0/12",
+            "134.196.0.0/16", "139.0.0.0/11", "139.128.0.0/11", "139.186.0.0/16",
+            "139.196.0.0/16", "139.208.0.0/12", "139.224.0.0/12",
+            "140.64.0.0/11", "140.128.0.0/11", "140.206.0.0/15", "140.224.0.0/12",
+            "140.240.0.0/13", "140.249.0.0/16", "140.250.0.0/15", "140.252.0.0/16",
+            "140.255.0.0/16",
+            "144.0.0.0/12", "144.48.0.0/12", "144.123.0.0/16", "144.255.0.0/16",
+            "150.0.0.0/16", "150.96.0.0/11", "150.128.0.0/11", "150.192.0.0/14",
+            "150.223.0.0/16", "150.242.0.0/15",
+            "152.104.128.0/17", "153.0.0.0/16", "153.3.0.0/16", "153.34.0.0/15",
+            "153.36.0.0/15", "153.99.0.0/16", "153.101.0.0/16", "153.118.0.0/15",
+            "153.120.0.0/13", "153.128.0.0/13", "153.136.0.0/15", "153.142.0.0/16",
+            "153.144.0.0/13", "153.152.0.0/14", "153.160.0.0/12", "153.184.0.0/13",
+            "153.192.0.0/11", "153.232.0.0/13", "153.240.0.0/12", "153.254.128.0/17",
+            "157.0.0.0/16", "157.18.0.0/15", "157.61.0.0/16", "157.122.0.0/15",
+            "157.148.0.0/16", "157.255.0.0/16",
+            "159.226.0.0/16", "161.207.0.0/16", "162.105.0.0/16", "163.0.0.0/16",
+            "163.53.0.0/16", "163.96.0.0/11", "163.128.0.0/11", "163.177.0.0/16",
+            "163.179.0.0/16", "163.204.0.0/16", "166.111.0.0/16", "167.139.0.0/16",
+            "167.189.0.0/16", "167.220.244.0/22", "168.160.0.0/16", "169.211.0.0/16",
+            "170.179.0.0/16", "171.0.0.0/13", "171.8.0.0/14", "171.12.0.0/16",
+            "171.32.0.0/11", "171.80.0.0/12", "171.96.0.0/13", "171.104.0.0/13",
+            "171.112.0.0/12", "171.208.0.0/12", "171.224.0.0/12",
+            "175.0.0.0/12", "175.16.0.0/15", "175.24.0.0/14", "175.30.0.0/15",
+            "175.42.0.0/15", "175.44.0.0/15", "175.46.0.0/16", "175.102.0.0/15",
+            "175.148.0.0/14", "175.152.0.0/14", "175.160.0.0/12", "175.178.0.0/15",
+            "175.184.0.0/13",
+            "180.64.0.0/13", "180.76.0.0/14", "180.88.0.0/13", "180.96.0.0/11",
+            "180.128.0.0/11", "180.160.0.0/12", "180.200.0.0/13", "180.208.0.0/12",
+            "180.232.0.0/14", "180.236.0.0/15", "180.248.0.0/13",
+            "182.16.0.0/12", "182.32.0.0/12", "182.48.0.0/14", "182.80.0.0/13",
+            "182.88.0.0/14", "182.92.0.0/15", "182.96.0.0/11", "182.128.0.0/12",
+            "182.144.0.0/13", "182.152.0.0/14", "182.200.0.0/13", "182.240.0.0/13",
+            "182.254.0.0/16",
+            "183.0.0.0/10", "183.64.0.0/13", "183.80.0.0/12", "183.128.0.0/11",
+            "183.160.0.0/12", "183.184.0.0/13", "183.192.0.0/10",
+            "188.128.0.0/11", "188.160.0.0/13",
+            "189.128.0.0/11", "189.160.0.0/13",
+            "192.83.122.0/24", "192.83.169.0/24", "192.124.154.0/24",
+            "192.188.170.0/24", "193.0.9.0/24", "193.109.122.0/24",
+            "198.2.200.0/24", "202.0.110.0/24", "202.0.176.0/24",
+            "202.4.128.0/19", "202.8.128.0/17", "202.14.88.0/21",
+            "202.14.236.0/24", "202.14.237.0/24", "202.20.64.0/19",
+            "202.38.0.0/16", "202.40.135.0/24", "202.40.136.0/24",
+            "202.40.144.0/24", "202.40.145.0/24", "202.40.148.0/24",
+            "202.40.150.0/24", "202.40.151.0/24", "202.40.156.0/24",
+            "202.40.158.0/24", "202.40.159.0/24", "202.41.152.0/22",
+            "202.41.224.0/19", "202.43.144.0/22", "202.43.188.0/22",
+            "202.45.128.0/19", "202.46.32.0/19", "202.46.224.0/19",
+            "202.47.0.0/19", "202.60.112.0/20", "202.63.248.0/22",
+            "202.69.4.0/22", "202.69.16.0/20", "202.69.32.0/19",
+            "202.69.128.0/18", "202.70.0.0/17", "202.74.8.0/21",
+            "202.75.208.0/20", "202.79.224.0/19", "202.80.192.0/18",
+            "202.83.16.0/20", "202.85.208.0/20", "202.90.0.0/20",
+            "202.90.224.0/20", "202.91.0.0/16", "202.92.0.0/17",
+            "202.92.252.0/22", "202.93.0.0/16", "202.95.0.0/17",
+            "202.95.224.0/19", "202.96.0.0/11", "202.128.0.0/17",
+            "202.130.0.0/16", "202.131.16.0/20", "202.131.48.0/20",
+            "202.131.208.0/21", "202.136.48.0/20", "202.136.208.0/20",
+            "202.136.224.0/19", "202.141.160.0/19", "202.142.16.0/20",
+            "202.143.16.0/20", "202.148.96.0/19", "202.149.32.0/19",
+            "202.149.160.0/19", "202.150.16.0/20", "202.152.176.0/21",
+            "202.153.48.0/20", "202.158.16.0/21", "202.158.240.0/20",
+            "202.160.176.0/20", "202.164.0.0/16", "202.165.96.0/19",
+            "202.165.176.0/20", "202.165.208.0/20", "202.168.160.0/19",
+            "202.170.128.0/19", "202.173.8.0/21", "202.173.224.0/19",
+            "202.179.240.0/20", "202.180.128.0/19", "202.181.112.0/20",
+            "202.189.80.0/20", "203.0.178.0/24", "203.18.50.0/23",
+            "203.56.0.0/16", "203.79.0.0/16", "203.80.144.0/20",
+            "203.83.56.0/22", "203.86.0.0/18", "203.86.64.0/19",
+            "203.88.32.0/21", "203.88.192.0/21", "203.89.0.0/20",
+            "203.90.0.0/22", "203.90.128.0/19", "203.90.192.0/19",
+            "203.91.32.0/20", "203.91.96.0/19", "203.91.120.0/21",
+            "203.93.0.0/22", "203.95.0.0/18", "203.95.96.0/19",
+            "203.99.16.0/20", "203.99.80.0/20", "203.100.32.0/20",
+            "203.100.80.0/20", "203.100.96.0/19", "203.100.192.0/19",
+            "203.102.0.0/18", "203.102.128.0/17", "203.105.0.0/19",
+            "203.105.96.0/19", "203.105.192.0/19", "203.106.0.0/18",
+            "203.106.128.0/17", "203.107.0.0/17", "203.107.128.0/18",
+            "203.109.128.0/18", "203.110.160.0/19", "203.114.160.0/19",
+            "203.115.0.0/19", "203.115.96.0/19", "203.118.192.0/20",
+            "203.119.24.0/21", "203.119.32.0/19", "203.128.0.0/11",
+            "203.160.0.0/13", "203.168.0.0/15", "203.170.128.0/18",
+            "203.171.224.0/20", "203.174.7.0/24", "203.174.96.0/19",
+            "203.175.128.0/17", "203.176.168.0/21", "203.176.224.0/19",
+            "203.184.80.0/20", "203.187.160.0/19", "203.189.0.0/19",
+            "203.189.192.0/19", "203.190.96.0/19", "203.191.0.0/18",
+            "203.191.144.0/20", "203.191.160.0/19", "203.192.0.0/18",
+            "203.195.64.0/18", "203.196.0.0/18", "203.202.0.0/16",
+            "203.207.64.0/18", "203.208.0.0/17", "203.208.128.0/18",
+            "203.209.224.0/19", "203.212.0.0/18", "203.212.80.0/20",
+            "203.212.112.0/20", "203.212.192.0/18", "203.215.232.0/21",
+            "203.216.0.0/17", "203.216.224.0/19", "203.218.0.0/15",
+            "203.220.192.0/20", "203.221.192.0/20", "203.222.192.0/19",
+            "203.223.0.0/19", "203.224.0.0/17", "203.224.128.0/18",
+            "203.225.0.0/17", "203.225.128.0/18", "203.248.0.0/16",
+            "210.2.0.0/16", "210.5.0.0/16", "210.12.0.0/15", "210.14.64.0/19",
+            "210.14.112.0/20", "210.14.128.0/17", "210.15.0.0/16", "210.16.128.0/17",
+            "210.21.0.0/16", "210.22.0.0/15", "210.25.0.0/16", "210.26.0.0/15",
+            "210.28.0.0/15", "210.32.0.0/12", "210.51.0.0/16", "210.52.0.0/15",
+            "210.56.192.0/18", "210.72.0.0/13", "210.82.0.0/15", "210.87.128.0/17",
+            "210.185.192.0/18", "210.192.96.0/19", "211.64.0.0/13", "211.80.0.0/12",
+            "211.96.0.0/13", "211.136.0.0/13", "211.144.0.0/12", "211.160.0.0/13",
+            "218.0.0.0/11", "218.56.0.0/13", "218.64.0.0/11", "218.96.0.0/11",
+            "218.185.192.0/18", "218.192.0.0/10", "219.72.0.0/13", "219.82.0.0/15",
+            "219.128.0.0/11", "219.216.0.0/13", "219.224.0.0/11",
+            "220.101.192.0/18", "220.112.0.0/12", "220.152.128.0/17", "220.154.0.0/15",
+            "220.160.0.0/11", "220.192.0.0/11", "220.232.64.0/18", "220.234.0.0/15",
+            "220.242.0.0/15", "220.248.0.0/13", "220.250.0.0/15", "221.0.0.0/13",
+            "221.8.0.0/14", "221.12.0.0/15", "221.14.0.0/16", "221.122.0.0/15",
+            "221.128.0.0/11", "221.176.0.0/13", "221.192.0.0/14", "221.196.0.0/15",
+            "221.198.0.0/16", "221.199.0.0/17", "221.199.128.0/18", "221.199.192.0/19",
+            "221.199.224.0/20", "221.199.240.0/21", "221.199.248.0/22", "221.199.252.0/23",
+            "221.199.254.0/24", "221.200.0.0/14", "221.204.0.0/15", "221.208.0.0/12",
+            "221.224.0.0/13", "222.16.0.0/12", "222.32.0.0/11", "222.64.0.0/11",
+            "222.125.128.0/17", "222.128.0.0/12", "222.160.0.0/14", "222.168.0.0/13",
+            "222.176.0.0/12", "222.192.0.0/11", "222.240.0.0/13",
+        ]
+        self.blocked_ranges_installed: Set[str] = set()  # Rangos ya aplicados en iptables
+
+    def add_blocked_country(self, country_code: str):
+        """Agrega país a lista de bloqueados y aplica reglas iptables"""
+        self.blocked_countries.add(country_code)
+        print(f"[🌍 GEOIP] País {country_code} bloqueado completamente")
+
+        # Aplicar reglas iptables para los rangos del país
+        self._apply_country_blocks(country_code)
+
+    def _apply_country_blocks(self, country_code: str):
+        """Aplica reglas iptables para bloquear rangos de un país"""
+        ranges = []
+        if country_code.upper() == "KP":
+            ranges = self.north_korea_ranges
+        elif country_code.upper() == "CN":
+            ranges = self.china_ranges
+
+        for cidr in ranges:
+            if cidr not in self.blocked_ranges_installed:
+                try:
+                    subprocess.run(
+                        ["iptables", "-A", "INPUT", "-s", cidr, "-j", "DROP"],
+                        check=False, capture_output=True
+                    )
+                    self.blocked_ranges_installed.add(cidr)
+                    print(f"[🌍 GEOIP] Bloqueado {cidr} ({country_code})")
+                except Exception as e:
+                    print(f"[!] Error bloqueando {cidr}: {e}")
+
+        print(f"[🌍 GEOIP] {country_code}: {len(ranges)} rangos bloqueados en iptables")
+
+    def check_blocked(self, ip: str, country: str) -> bool:
+        """Verifica si IP está en país bloqueado"""
+        if country in self.blocked_countries:
+            print(f"[🌍 GEOIP] {ip} está en país bloqueado ({country}) → BAN")
+            return True
+        return False
+
+    def check_ip_country(self, ip: str) -> Optional[str]:
+        """Verifica si una IP pertenece a China o Corea del Norte por rangos"""
+        import ipaddress
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+
+            # Verificar Corea del Norte
+            for cidr in self.north_korea_ranges:
+                if ip_obj in ipaddress.ip_network(cidr, strict=False):
+                    return "KP"
+
+            # Verificar China (solo primeros rangos para rendimiento)
+            for cidr in self.china_ranges[:500]:  # Limitar para no afectar rendimiento
+                if ip_obj in ipaddress.ip_network(cidr, strict=False):
+                    return "CN"
+        except:
+            pass
+        return None
+
+# Función 9: ASN-Based Blocking (Bloqueo por ISP)
+class ASNBlocker:
+    """Bloquea rangos completos de ISP/ASN"""
+
+    def __init__(self):
+        self.blocked_asns: Set[str] = set()  # ASNs bloqueados
+        self.asn_cache: Dict[str, str] = {}  # IP -> ASN cache
+
+    def add_blocked_asn(self, asn: str):
+        """Agrega ASN a lista de bloqueados"""
+        self.blocked_asns.add(asn)
+        print(f"[🌐 ASN] AS{asn} bloqueado completamente")
+
+    def check_blocked(self, ip: str, asn: str) -> bool:
+        """Verifica si IP está en ASN bloqueado"""
+        if asn in self.blocked_asns:
+            print(f"[🌐 ASN] {ip} está en ASN bloqueado (AS{asn}) → BAN")
+            return True
+        return False
+
+# Función 10: Time-Based Rules (Reglas por horario)
+class TimeBasedRules:
+    """Aplica reglas diferentes según horario"""
+
+    def __init__(self):
+        self.night_mode = False
+        self.night_start = 22  # 10 PM
+        self.night_end = 6     # 6 AM
+        self.night_threshold_multiplier = 0.5  # Más estricto de noche
+
+    def check_time(self) -> float:
+        """Retorna multiplicador de threshold según hora"""
+        hour = datetime.now().hour
+        if hour >= self.night_start or hour <= self.night_end:
+            if not self.night_mode:
+                print("[⏰ TIME-BASED] Modo nocturno activado (más estricto)")
+                self.night_mode = True
+            return self.night_threshold_multiplier
+        else:
+            if self.night_mode:
+                print("[⏰ TIME-BASED] Modo diurno activado (normal)")
+                self.night_mode = False
+            return 1.0
+
+# Función 11: Automatic Whitelist Learning
+class AutoWhitelistLearner:
+    """Aprende tráfico normal y crea whitelist automática"""
+
+    def __init__(self):
+        self.traffic_patterns: Dict[str, int] = defaultdict(int)
+        self.learning_window = 86400  # 24 horas de aprendizaje
+        self.whitelist_threshold = 100  # 100 conexiones/día = tráfico normal
+
+    def register_connection(self, ip: str):
+        """Registra conexión para aprendizaje"""
+        self.traffic_patterns[ip] += 1
+
+    def get_learned_whitelist(self) -> Set[str]:
+        """Retorna IPs con tráfico normal"""
+        return {ip for ip, count in self.traffic_patterns.items() if count >= self.whitelist_threshold}
+
+# Función 12: Decoy Detection (Detección de señuelos)
+class DecoyDetector:
+    """Detecta si atacante usa IPs señuelo"""
+
+    def __init__(self):
+        self.ip_clusters: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        self.decoy_threshold = 10  # 10+ IPs similares = posible decoy
+
+    def register_attack(self, ip: str):
+        """Registra ataque y detecta patrones de decoy"""
+        now = time.time()
+        # Agrupar por primeros 3 octetos
+        parts = ip.split('.')
+        if len(parts) >= 3:
+            cluster = f"{parts[0]}.{parts[1]}.{parts[2]}"
+            self.ip_clusters[cluster].append((ip, now))
+
+            # Limpiar IPs viejas (> 5 minutos)
+            self.ip_clusters[cluster] = [(i, t) for i, t in self.ip_clusters[cluster] if now - t < 300]
+
+            if len(self.ip_clusters[cluster]) >= self.decoy_threshold:
+                print(f"[🎭 DECOY DETECTED] {len(self.ip_clusters[cluster])} IPs similares desde {cluster}.*")
+                return True
+        return False
+
+# Función 13: Fragment Attack Detection
+class FragmentAttackDetector:
+    """Detecta ataques con paquetes fragmentados"""
+
+    def __init__(self):
+        self.fragment_count: Dict[str, int] = defaultdict(int)
+        self.fragment_threshold = 100  # 100 fragmentos = ataque
+
+    def register_fragment(self, ip: str) -> bool:
+        """Registra fragmento y detecta ataque"""
+        self.fragment_count[ip] += 1
+
+        if self.fragment_count[ip] >= self.fragment_threshold:
+            print(f"[🧩 FRAGMENT ATTACK] {ip} envió {self.fragment_count[ip]} fragmentos → BANEANDO")
+            return True
+        return False
+
+# Función 14: Invalid Packet Detector
+class InvalidPacketDetector:
+    """Detecta y bloquea paquetes malformados"""
+
+    def __init__(self):
+        self.invalid_patterns = [
+            r"INVALID",
+            r"MALFORMED",
+            r"CRC ERROR",
+            r"LENGTH MISMATCH",
+            r"HEADER ERROR"
+        ]
+
+    def check_packet(self, log_line: str) -> bool:
+        """Verifica si log contiene paquetes inválidos"""
+        for pattern in self.invalid_patterns:
+            if pattern in log_line.upper():
+                ip_match = re.search(r"SRC=([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", log_line)
+                if ip_match:
+                    print(f"[❌ INVALID PACKET] Paquete malformado desde {ip_match.group(1)}")
+                    return True
+        return False
+
+# Función 15: Connection Tracking Limits
+class ConnectionTracker:
+    """Limita conexiones concurrentes por IP"""
+
+    def __init__(self):
+        self.active_connections: Dict[str, int] = defaultdict(int)
+        self.max_connections = 50  # Máximo 50 conexiones simultáneas
+
+    def register_connection(self, ip: str) -> bool:
+        """Registra conexión y verifica límite"""
+        self.active_connections[ip] += 1
+
+        if self.active_connections[ip] > self.max_connections:
+            print(f"[🔗 CONN LIMIT] {ip} excedió {self.max_connections} conexiones simultáneas → BANEANDO")
+            return True
+        return False
+
+    def release_connection(self, ip: str):
+        """Libera conexión cuando termina"""
+        if self.active_connections[ip] > 0:
+            self.active_connections[ip] -= 1
+
+# ==================== ESTADO PERSISTENTE ====================
+class PersistentState:
+    """Gestiona el estado persistente del daemon"""
+
+    def __init__(self, state_file: str):
+        self.state_file = state_file
+        self.attack_counter: Dict[str, int] = {}
+        self.attack_timestamps: Dict[str, List[float]] = defaultdict(list)
+        self.banned_ips: Set[str] = set()
+        self.temp_bans: Dict[str, float] = {} # IP -> timestamp de expiración
+        self.statistics = {
+            "total_attacks": 0,
+            "total_bans": 0,
+            "total_blocks": 0,
+            "start_time": datetime.now().isoformat(),
+            "last_attack": None,
+            "top_attackers": [],
+            "attacks_by_day": defaultdict(int),
+            "ai_detected_threats": 0,
+            "ai_false_positives": 0,
+        }
+        self.recent_events: Deque[Dict] = deque(maxlen=1000) # Guarda los últimos 1000 eventos
+
+        # Trackers para funciones de última generación
+        self.dns_query_tracker: Dict[str, Deque[float]] = defaultdict(lambda: deque()) # IP -> timestamps de queries DNS
+        self.network_scan_tracker: Dict[str, Dict[str, Deque[float]]] = defaultdict(lambda: defaultdict(lambda: deque())) # IP -> {Protocolo -> Deque de timestamps}
+        self.file_monitor_log: Dict[str, Deque[Tuple[str, float]]] = defaultdict(lambda: deque()) # IP -> Deque de (nombre_archivo, timestamp)
+        self.process_monitor_log: Dict[str, Deque[Tuple[str, float]]] = defaultdict(lambda: deque()) # IP -> Deque de (comando, timestamp)
+        self.network_traffic_log: Dict[str, Deque[Tuple[int, float]]] = defaultdict(lambda: deque()) # IP -> Deque de (bytes_salientes, timestamp)
+
+        self.load()
+
+    def load(self):
+        """Carga el estado desde archivo"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    data = json.load(f)
+                    self.attack_counter = data.get('attack_counter', {})
+                    self.attack_timestamps = defaultdict(list, data.get('attack_timestamps', {}))
+                    self.banned_ips = set(data.get('banned_ips', []))
+                    self.temp_bans = data.get('temp_bans', {})
+                    self.statistics.update(data.get('statistics', {}))
+                    if 'attacks_by_day' in data.get('statistics', {}):
+                        self.statistics['attacks_by_day'] = defaultdict(
+                            int, self.statistics['attacks_by_day']
+                        )
+                    if 'recent_events' in data:
+                        self.recent_events = deque(data['recent_events'], maxlen=1000)
+
+                    # Cargar nuevos trackers (manejo de errores si no existen)
+                    self.dns_query_tracker = {k: deque(v) for k, v in data.get('dns_query_tracker', {}).items()}
+                    self.network_scan_tracker = {k: {p: deque(q) for p, q in v.items()} for k, v in data.get('network_scan_tracker', {}).items()}
+                    self.file_monitor_log = {k: deque(v) for k, v in data.get('file_monitor_log', {}).items()}
+                    self.process_monitor_log = {k: deque(v) for k, v in data.get('process_monitor_log', {}).items()}
+                    self.network_traffic_log = {k: deque(v) for k, v in data.get('network_traffic_log', {}).items()}
+
+                print(f"[✓] Estado cargado: {len(self.banned_ips)} IPs baneadas")
+        except Exception as e:
+            print(f"[!] Error cargando estado: {e}")
+
+    def save(self):
+        """Guarda el estado en archivo"""
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            data = {
+                'attack_counter': self.attack_counter,
+                'attack_timestamps': dict(self.attack_timestamps),
+                'banned_ips': list(self.banned_ips),
+                'temp_bans': self.temp_bans,
+                'statistics': self.statistics,
+                'recent_events': list(self.recent_events),
+
+                # Guardar nuevos trackers
+                'dns_query_tracker': {k: list(v) for k, v in self.dns_query_tracker.items()},
+                'network_scan_tracker': {k: {p: list(q) for p, q in v.items()} for k, v in self.network_scan_tracker.items()},
+                'file_monitor_log': {k: list(v) for k, v in self.file_monitor_log.items()},
+                'process_monitor_log': {k: list(v) for k, v in self.process_monitor_log.items()},
+                'network_traffic_log': {k: list(v) for k, v in self.network_traffic_log.items()},
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[!] Error guardando estado: {e}")
+
+    def cleanup_expired_bans(self) -> List[str]:
+        """Elimina bans temporales expirados"""
+        now = time.time()
+        expired = [ip for ip, exp in self.temp_bans.items() if now > exp]
+        for ip in expired:
+            del self.temp_bans[ip]
+            self.banned_ips.discard(ip)
+        return expired
+
+# ==================== SISTEMA DE NOTIFICACIONES ====================
+class NotificationSystem:
+    """Envía notificaciones al usuario (escritorio y log)"""
+
+    def __init__(self):
+        self.notification_log: List[Dict] = []
+        self.current_user = self._get_current_user()
+        self.dbus_address = self._get_dbus_session_bus_address()
+
+    def _get_current_user(self) -> str:
+        return os.getenv('SUDO_USER') or os.getenv('USER') or 'root'
+
+    def _get_dbus_session_bus_address(self) -> Optional[str]:
+        try:
+            uid = os.getuid() if self.current_user == 'root' else os.getpwnam(self.current_user).pw_uid
+            dbus_path = f"/run/user/{uid}/bus"
+            if os.path.exists(dbus_path):
+                return f"unix:path={dbus_path}"
+        except Exception:
+            pass
+        return None
+
+    def send_notification(self, title: str, message: str, urgency: str = "normal", icon: str = "dialog-warning", log: bool = True) -> bool:
+        """
+        Envía una notificación al escritorio del usuario (si es posible) y al log del sistema.
+        """
+        success = False
+        try:
+            if self.current_user!= "root" and self.dbus_address:
+                cmd = (
+                    f"sudo -u {self.current_user} "
+                    f"DISPLAY=:0 "
+                    f"DBUS_SESSION_BUS_ADDRESS={self.dbus_address} "
+                    f"notify-send '{title}' '{message}' -u {urgency} -i {icon}"
+                )
+                result = os.system(cmd)
+                success = (result == 0)
+        except Exception as e:
+            print(f"[!] notify-send falló: {e}")
+
+        if not success:
+            try:
+                subprocess.run(
+                    ["logger", "-t", "ShieldLinux", f"{title}: {message}"],
+                    check=True
+                )
+                success = True
+            except:
+                pass
+
+        if log:
+            self.notification_log.append({
+                "timestamp": datetime.now().isoformat(),
+                "title": title,
+                "message": message,
+                "success": success
+            })
+
+        prefix = "✓" if success else "✗"
+        print(f"[{prefix}] {title}: {message}")
+
+        return success
+
+# ==================== GESTOR DE BANS ====================
+class BanManager:
+    """Gestiona el baneado y desbaneado de IPs usando UFW"""
+
+    def __init__(self, state: PersistentState, notifier: NotificationSystem, security: 'SecurityFunctions'):
+        self.state = state
+        self.notifier = notifier
+        self.security = security
+
+    def _check_ufw_rule_exists(self, ip: str) -> bool:
+        """Verifica si ya existe una regla UFW para denegar el tráfico de esta IP."""
+        try:
+            result = subprocess.run(["ufw", "status", "numbered"], capture_output=True, text=True, check=False)
+            # Buscar "DENY" y la IP. ufw status puede mostrar "DENY ALL from X.X.X.X" o "DENY Anywhere from X.X.X.X"
+            if re.search(r"DENY\s+(ALL|Anywhere)\s+from\s+" + re.escape(ip), result.stdout):
+                return True
+        except Exception as e:
+            print(f"[!] Error al verificar reglas UFW para {ip}: {e}")
+        return False
+
+    def ban_ip(self, ip: str, ban_time: int = BAN_TIME_DEFAULT, reason: str = "unknown") -> bool:
+        """Banea una IP con UFW"""
+        # Verificar whitelist del sistema (IPs críticas que nunca deben banearse)
+        if ip in SYSTEM_WHITELIST:
+            print(f"[!] Intento de banear IP del sistema: {ip}. Ignorando por seguridad.")
+            return False
+
+        if ip in self.security.whitelist:
+            print(f"[!] Intento de banear IP en whitelist: {ip}. Ignorando.")
+            self.notifier.send_notification("ALERTA DE SEGURIDAD", f"Intento de banear IP en whitelist: {ip}", urgency="critical")
+            return False
+
+        # Paso 1: Verificar si ya existe una regla UFW para esta IP
+        if self._check_ufw_rule_exists(ip):
+            if ip not in self.state.banned_ips:
+                self.state.banned_ips.add(ip) # Sincronizar estado interno si la regla ya existe
+                print(f"[✓] IP {ip} ya está baneada por UFW, sincronizando estado interno.")
+            # Actualizar tiempo de expiración si es un ban temporal nuevo o extendido
+            if ban_time > 0:
+                expiration_time = time.time() + (ban_time * 60)
+                self.state.temp_bans[ip] = expiration_time
+            self.state.save()
+            return True # Ya baneada, no hay que hacer nada más con UFW
+
+        # Paso 2: Si no existe la regla, intentar añadirla
+        try:
+            # Comando para banear: ufw --force insert 1 deny from <IP> to any
+            # '--force' evita la confirmación interactiva
+            # 'insert 1' asegura que la regla se añade al principio, dándole prioridad
+            result = subprocess.run(
+                ["ufw", "--force", "insert", "1", "deny", "from", ip, "to", "any"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            self.state.banned_ips.add(ip)
+            self.state.statistics['total_bans'] += 1
+            log_message = f"{datetime.now().isoformat()} - BAN: {ip} - Razón: {reason}"
+            if ban_time > 0:
+                expiration_time = time.time() + (ban_time * 60)
+                self.state.temp_bans[ip] = expiration_time
+                log_message += f" - Expira en {ban_time} minutos"
+            else:
+                log_message += " - Permanente"
+
+            with open(BAN_LOG_PATH, 'a') as f:
+                f.write(log_message + "\n")
+
+            self.state.save()
+            self.notifier.send_notification("IP BANEADA", f"IP {ip} baneada por {reason}", urgency="critical")
+            print(f"[✓] BAN: {ip} (Razón: {reason})")
+            return True
+        except subprocess.CalledProcessError as e:
+            # Si el comando falla, aquí capturamos el error
+            error_output = e.stderr.strip()
+            print(f"[!] Error baneando {ip}: {error_output}")
+            self.notifier.send_notification("ERROR DE BANEO", f"Fallo al banear {ip}: {error_output}", urgency="critical")
+
+            # Intentar analizar el error para ver si la regla ya existe de otra forma
+            if "Rule added" in error_output or "already exists" in error_output:
+                print(f"[!] Error de UFW indica que la regla para {ip} ya existía. Sincronizando estado.")
+                self.state.banned_ips.add(ip) # Sincronizar estado interno
+                if ban_time > 0:
+                    expiration_time = time.time() + (ban_time * 60)
+                    self.state.temp_bans[ip] = expiration_time
+                self.state.save()
+                return True # Consideramos que el ban se realizó o ya existía
+
+            return False
+        except Exception as e:
+            print(f"[!] Error inesperado al banear {ip}: {e}")
+            self.notifier.send_notification("ERROR DE BANEO", f"Fallo inesperado al banear {ip}: {e}", urgency="critical")
+            return False
+
+    def unban_ip(self, ip: str) -> bool:
+        """Elimina un ban de una IP"""
+        # Aunque la IP no esté en nuestro estado interno, intentamos eliminar la regla de UFW por si acaso.
+        if ip not in self.state.banned_ips and ip not in self.state.temp_bans and not self._check_ufw_rule_exists(ip):
+            print(f"[i] IP {ip} no está baneada internamente ni tiene regla UFW conocida.")
+            return True # No baneada o ya desbaneada
+
+        try:
+            result = subprocess.run(
+                ["ufw", "status", "numbered"],
+                capture_output=True, text=True, check=True
+            )
+
+            lines = result.stdout.split('\n')
+            found_rule = False
+            for i, line in enumerate(lines):
+                # Usamos regex para ser más flexibles con el formato de la regla
+                match = re.search(r'\[\s*(\d+)\].*(DENY)\s+(ALL|Anywhere)\s+from\s+' + re.escape(ip), line)
+                if match:
+                    rule_num = match.group(1)
+                    print(f"[i] Encontrada regla UFW número {rule_num} para {ip}. Eliminando...")
+                    subprocess.run(
+                        ["ufw", "delete", rule_num],
+                        check=True, capture_output=True
+                    )
+                    print(f"[✓] UNBAN: {ip} (regla {rule_num} eliminada)")
+                    self.notifier.send_notification("IP DESBANEADA", f"IP {ip} desbaneada", urgency="low")
+                    found_rule = True
+                    break # Asumiendo una única regla DENY por IP para simplificar
+
+            if not found_rule:
+                print(f"[!] No se encontró regla UFW explícita para {ip}. Limpiando solo estado interno si aplica.")
+
+            # Limpiar estado interno
+            self.state.banned_ips.discard(ip)
+            self.state.temp_bans.pop(ip, None)
+            self.state.save()
+            return True
+
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Error unbaneando {ip} con UFW: {e.stderr.strip()}")
+            self.notifier.send_notification("ERROR DE DESBANEO", f"Fallo al desbanear {ip}: {e.stderr.strip()}", urgency="medium")
+            return False
+        except Exception as e:
+            print(f"[!] Error inesperado al desbanear {ip}: {e}")
+            self.notifier.send_notification("ERROR DE DESBANEO", f"Fallo inesperado al desbanear {ip}: {e}", urgency="medium")
+            return False
+
+# ==================== FUNCIONES DE SEGURIDAD AVANZADAS ====================
+class SecurityFunctions:
+    """Funciones de seguridad potenciadas con detección y respuesta"""
+
+    def __init__(self, state: PersistentState, config: dict):
+        self.state = state
+        self.config = config
+        self.port_scan_tracker: Dict[str, Set[int]] = defaultdict(set)
+        self.ddos_tracker: Dict[str, Deque[float]] = defaultdict(lambda: deque())
+        self.brute_force_tracker: Dict[str, Deque[float]] = defaultdict(lambda: deque())
+        self.geo_cache: Dict[str, str] = {}
+        self.whitelist: Set[str] = self._load_list(WHITELIST_FILE)
+        self.blacklist: Set[str] = self._load_list(BLACKLIST_FILE)
+        self.known_attackers = self._load_known_attackers()
+        self.suspicious_patterns = self._load_suspicious_patterns()
+        self.threat_intel = self._load_threat_intel()
+
+        # Trackers para funciones de última generación
+        self.dns_query_tracker: Dict[str, Deque[float]] = defaultdict(lambda: deque())
+        self.network_scan_tracker: Dict[str, Dict[str, Deque[float]]] = defaultdict(lambda: defaultdict(lambda: deque()))
+        self.file_monitor_log: Dict[str, Deque[Tuple[str, float]]] = defaultdict(lambda: deque())
+        self.process_monitor_log: Dict[str, Deque[Tuple[str, float]]] = defaultdict(lambda: deque())
+        self.network_traffic_log: Dict[str, Deque[Tuple[int, float]]] = defaultdict(lambda: deque())
+
+    def _load_list(self, filepath: str) -> Set[str]:
+        """Carga whitelist/blacklist desde archivo"""
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    data = json.load(f)
+                    return set(data.get('ips', []))
+        except:
+            pass
+        return set()
+
+    def _save_list(self, filepath: str, ips: Set[str]):
+        """Guarda lista en archivo"""
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, 'w') as f:
+                json.dump({'ips': list(ips), 'updated': datetime.now().isoformat()}, f, indent=2)
+        except Exception as e:
+            print(f"[!] Error guardando {filepath}: {e}")
+
+    def _load_known_attackers(self) -> Set[str]:
+        """Carga base de datos de atacantes conocidos (rangos IP sospechosos)"""
+        return {
+            "1.2.3.4",
+            "5.6.7.0/24"
+        }
+
+    def _load_suspicious_patterns(self) -> List[str]:
+        """Patrones de comportamiento sospechoso en logs"""
+        return [
+            r'SRC=10\.\d+\.\d+\.\d+',
+            r'SRC=172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+',
+            r'SRC=192\.168\.\d+\.\d+',
+            r'SYN_FLOOD',
+            r'NMAP',
+            r'SSH_BRUTE_FORCE',
+            r'WEB_EXPLOIT',
+            r'FAILED_PASSWORD',
+        ]
+
+    def _load_threat_intel(self) -> Dict[str, Dict]:
+        """Carga datos de inteligencia de amenazas desde un archivo JSON"""
+        if not os.path.exists(THREAT_INTEL_FILE):
+            return {}
+        try:
+            with open(THREAT_INTEL_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[!] Error cargando Threat Intel: {e}")
+            return {}
+
+    def add_to_whitelist(self, ip: str):
+        """Añade IP a la whitelist"""
+        self.whitelist.add(ip)
+        self._save_list(WHITELIST_FILE, self.whitelist)
+
+    def add_to_blacklist(self, ip: str, reason: str = "manual"):
+        """Añade IP a la blacklist"""
+        self.blacklist.add(ip)
+        self._save_list(BLACKLIST_FILE, self.blacklist)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FUNCIONES DE SEGURIDAD AVANZADAS (Existentes + 10 NUEVAS)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # Función 1: Detección de Port Scanning
+    def detect_port_scan(self, ip: str, port: int) -> bool:
+        """Detecta escaneo de puertos por una única IP."""
+        if ip in self.whitelist: return False
+        self.port_scan_tracker[ip].add(port)
+        if len(self.port_scan_tracker[ip]) >= self.config['scan_threshold']:
+            return True
+        return False
+
+    # Función 2: Detección de Ataques DDoS Básica
+    def detect_ddos(self, ip: str) -> bool:
+        """Detecta patrones de DDoS/inundación por una única IP."""
+        if ip in self.whitelist: return False
+        now = time.time()
+        self.ddos_tracker[ip].append(now)
+        while self.ddos_tracker[ip] and self.ddos_tracker[ip][0] < now - self.config['rate_limit_window']:
+            self.ddos_tracker[ip].popleft()
+        if len(self.ddos_tracker[ip]) >= self.config['ddos_threshold']:
+            return True
+        return False
+
+    # Función 3: Detección de Fuerza Bruta
+    def detect_brute_force(self, ip: str, success: bool = False, service: str = "SSH") -> bool:
+        """Detecta intentos de fuerza bruta (ej. SSH) analizando fallos de autenticación."""
+        if ip in self.whitelist: return False
+        now = time.time()
+        if not success:
+            self.brute_force_tracker[ip].append(now)
+            while self.brute_force_tracker[ip] and self.brute_force_tracker[ip][0] < now - BRUTE_FORCE_WINDOW:
+                self.brute_force_tracker[ip].popleft()
+            if len(self.brute_force_tracker[ip]) >= BRUTE_FORCE_THRESHOLD:
+                print(f"[!] FUERZA BRUTA detectada desde {ip} en servicio {service} ({len(self.brute_force_tracker[ip])} intentos fallidos)")
+                return True
+        return False
+
+    # Función 4: Detección de Geobloqueo
+    def check_geoblock(self, ip: str, allowed_countries: List[str] = None) -> bool:
+        """Verifica si la IP proviene de un país no permitido. (Necesita un lookup de geo-IP)"""
+        if ip in self.whitelist: return False
+        if allowed_countries is None:
+            allowed_countries = ["BR", "US"]
+        country = self._get_ip_country(ip)
+        if country and country not in allowed_countries:
+            print(f"[!] Intento de conexión desde país no permitido: {ip} ({country})")
+            return True
+        return False
+
+    def _get_ip_country(self, ip: str) -> Optional[str]:
+        # Simulación de Geo-IP
+        if ip.startswith("187."): return "BR"
+        if ip.startswith("172."): return "US"
+        if ip.startswith("45."): return "RU"
+        if ip.startswith("89."): return "CN"
+        return None
+
+    # Función 5: Detección de Atacantes Conocidos
+    def check_known_attacker(self, ip: str) -> bool:
+        """Verifica si la IP está en una lista de atacantes conocidos."""
+        if ip in self.whitelist: return False
+        if ip in self.known_attackers:
+            print(f"[!] IP conocida como atacante: {ip}")
+            return True
+        for known_range in self.known_attackers:
+            if '/' in known_range:
+                try:
+                    ip_addr = int(struct.unpack("!I", socket.inet_aton(ip))[0])
+                    net_addr, bits = known_range.split('/')
+                    net_addr = int(struct.unpack("!I", socket.inet_aton(net_addr))[0])
+                    mask = (0xFFFFFFFF << (32 - int(bits))) & 0xFFFFFFFF
+                    if (ip_addr & mask) == (net_addr & mask):
+                        print(f"[!] IP en rango de atacante conocido: {ip} ({known_range})")
+                        return True
+                except (socket.error, ValueError):
+                    continue
+        return False
+
+    # Función 6: Detección de Honeypot
+    def detect_honeypot_interaction(self, ip: str, log_line: str) -> bool:
+        """Detecta si una IP ha interactuado con un honeypot."""
+        if ip in self.whitelist: return False
+        if "HONEYPOT_INTERACTION" in log_line:
+            print(f"[!] Interacción con Honeypot detectada desde {ip}")
+            return True
+        return False
+
+    # Función 7: Análisis de Entropía en Cadenas
+    def analyze_entropy(self, data: str, threshold: float = 5.5) -> bool:
+        """Analiza la entropía de una cadena para detectar payloads maliciosos.
+
+        Umbral aumentado a 5.5 para reducir falsos positivos en logs normales.
+        La entropía de textos normales en español está entre 3.5-4.5 bits.
+        """
+        if not data:
+            return False
+        # Ignorar líneas que parecen timestamps o logs normales del sistema
+        if re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', data):
+            return False
+        freq = defaultdict(int)
+        for char in data:
+            freq[char] += 1
+        entropy = 0.0
+        total = len(data)
+        for char_count in freq.values():
+            probability = char_count / total
+            if probability > 0:
+                entropy -= probability * math.log2(probability)
+        if entropy > threshold:
+            print(f"[!] Alta entropía detectada en cadena. Posible ataque: {data[:50]}...")
+            return True
+        return False
+
+    # Función 8: Validación de Header HTTP
+    def validate_http_headers(self, log_line: str) -> bool:
+        """Detecta headers HTTP malformados o sospechosos."""
+        if "HTTP_HEADER_ERROR" in log_line or \
+           re.search(r"User-Agent:\s*(\w{1,5})[\s/\(\)\\-]*\w{1,5}", log_line):
+            print(f"[!] Header HTTP sospechoso o malformado detectado en log: {log_line[:100]}...")
+            return True
+        return False
+
+    # Función 9: Detección de SQL Injection
+    def detect_sql_injection(self, log_line: str) -> bool:
+        """Detecta patrones comunes de SQL Injection en URLs o payloads."""
+        sql_patterns = [
+            r"SELECT.*? FROM", r"UNION SELECT", r"ORDER BY \d+", r"information_schema",
+            r"SLEEP\(\d+\)", r"benchmark\(", r"xp_cmdshell", r"\' OR \'1\'=\'1",
+            r"\" OR \"1\"=\"1", r"\' OR 1=1--"
+        ]
+        for pattern in sql_patterns:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                print(f"[!] Posible SQL Injection detectada en log: {log_line[:100]}...")
+                return True
+        return False
+
+    # Función 10: Detección de Cross-Site Scripting (XSS)
+    def detect_xss(self, log_line: str) -> bool:
+        """Detecta patrones comunes de XSS en URLs o parámetros."""
+        xss_patterns = [
+            r"<script>", r"javascript:", r"onload=", r"onerror=", r"alert\(",
+            r"document\.cookie", r"%3cscript%3e", r"%20onfocus%3d",
+        ]
+        for pattern in xss_patterns:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                print(f"[!] Posible XSS detectado en log: {log_line[:100]}...")
+                return True
+        return False
+
+    # Función 11: Detección de LFI/RFI (Local/Remote File Inclusion)
+    def detect_file_inclusion(self, log_line: str) -> bool:
+        """Detecta intentos de Local/Remote File Inclusion."""
+        lfi_rfi_patterns = [
+            r"../../", r"etc/passwd", r"boot.ini", r"php://filter",
+            r"data://text/plain", r"file:///", r"C:\\Windows\\System32",
+            r"/proc/self/environ",
+        ]
+        for pattern in lfi_rfi_patterns:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                print(f"[!] Posible File Inclusion detectada en log: {log_line[:100]}...")
+                return True
+        return False
+
+    # Función 12: Detección de Ataques de Sesión
+    def detect_session_attack(self, log_line: str) -> bool:
+        """Detecta patrones asociados con secuestro o fijación de sesión."""
+        session_patterns = [
+            r"JSESSIONID=\w{32,}", r"PHPSESSID=\w{20,}",
+            r"cookie:.*?sessionid=.*?length=\d{5,}", r"Set-Cookie:.*?new_session_id=.*",
+        ]
+        for pattern in session_patterns:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                print(f"[!] Posible ataque de Sesión detectado en log: {log_line[:100]}...")
+                return True
+        return False
+
+    # Función 13: Detección de Evasión de Firewall
+    def detect_firewall_evasion(self, log_line: str) -> bool:
+        """Detecta técnicas de evasión de firewall, como fragmentación IP o TTL bajo."""
+        evasion_patterns = [
+            r"DF=0", r"TTL=(\d{1,2})", r"SYN_ACK_FIN", r"XMAS_SCAN",
+        ]
+        for pattern in evasion_patterns:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                ttl_match = re.search(r"TTL=(\d{1,2})", log_line)
+                if ttl_match and int(ttl_match.group(1)) < 64:
+                    print(f"[!] Posible evasión de Firewall (TTL bajo) detectada en log: {log_line[:100]}...")
+                    return True
+                elif not ttl_match:
+                    print(f"[!] Posible evasión de Firewall detectada en log: {log_line[:100]}...")
+                    return True
+        return False
+
+    # Función 14: Verificación de Integridad de Archivos (Pasiva, basada en logs)
+    def check_file_integrity_log(self, log_line: str, critical_files: Dict[str, str] = None) -> bool:
+        """
+        Detecta en logs si un archivo crítico ha sido modificado o accedido de forma inusual.
+        Esto sería una detección pasiva basada en la presencia de logs de monitoreo de integridad (ej. auditd).
+        """
+        if critical_files is None:
+            critical_files = {
+                "/etc/passwd": "some_expected_hash_for_passwd",
+                "/etc/shadow": "some_expected_hash_for_shadow",
+                "/bin/su": "some_expected_hash_for_su",
+            }
+        for path in critical_files.keys():
+            if f"changed={path}" in log_line or f"integrity_violation={path}" in log_line:
+                print(f"[!] ALERTA DE INTEGRIDAD DE ARCHIVOS: Log indica cambio en {path}.")
+                return True
+        return False
+
+    # Función 15: Detección de Actividad C2 (Command and Control)
+    def detect_c2_activity(self, log_line: str) -> bool:
+        """Detecta patrones heurísticos que podrían indicar actividad de Command and Control."""
+        c2_patterns = [
+            r"CONNECT_TO_KNOWN_C2_IP", r"DNS_QUERY_HIGH_ENTROPY",
+            r"HTTP_POST_LARGE_DATA_TO_UNUSUAL_DOMAIN",
+        ]
+        for pattern in c2_patterns:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                print(f"[!] Posible actividad C2 detectada en log: {log_line[:100]}...")
+                return True
+        return False
+
+    # ==================== 10 NUEVAS FUNCIONES DE SEGURIDAD DE ÚLTIMA GENERACIÓN ====================
+
+    # Función 16: Detección de Escaneo de Red (Network Scan Detection)
+    def detect_network_scan(self, ip: str, port: int, protocol: str = "TCP") -> bool:
+        """Detecta si una IP está realizando un escaneo de red en múltiples puertos/protocolos."""
+        if ip in self.whitelist:
+            return False
+        now = time.time()
+        # Almacenar timestamp para seguimiento temporal
+        self.network_scan_tracker[ip][protocol].append(now)
+        # Limpiar eventos antiguos
+        while self.network_scan_tracker[ip][protocol] and self.network_scan_tracker[ip][protocol][0] < now - NETWORK_SCAN_TIME_WINDOW:
+            self.network_scan_tracker[ip][protocol].popleft()
+
+        # Si hay muchos eventos en la ventana, es un escaneo
+        if len(self.network_scan_tracker[ip][protocol]) >= NETWORK_SCAN_PORTS_COUNT:
+            print(f"[!] ESCANEO DE RED detectado desde {ip} en protocolo {protocol}!")
+            return True
+        return False
+
+    # Función 17: Detección de Anomalías DNS (DNS Anomaly Detection)
+    def detect_dns_anomaly(self, ip: str) -> bool:
+        """Detecta un volumen inusual de consultas DNS, indicativo de botnets o exfiltración de DNS."""
+        if ip in self.whitelist: return False
+        now = time.time()
+        self.dns_query_tracker[ip].append(now)
+        # Eliminar timestamps viejos
+        while self.dns_query_tracker[ip] and self.dns_query_tracker[ip][0] < now - 5: # Ventana de 5 segundos
+            self.dns_query_tracker[ip].popleft()
+        if len(self.dns_query_tracker[ip]) >= DNS_ANOMALY_THRESHOLD:
+            print(f"[!] ANOMALÍA DNS detectada para {ip}: {len(self.dns_query_tracker[ip])} consultas en 5s!")
+            return True
+        return False
+
+    # Función 18: Detección Heurística de Escalada de Privilegios (Privilege Escalation Heuristics)
+    def detect_privilege_escalation(self, log_line: str, process_owner: str = None) -> bool:
+        """
+        Detecta patrones en logs que sugieren un intento de escalada de privilegios.
+        Requiere logs de auditoría del sistema (ej. auditd, journalctl).
+        """
+        # Buscar palabras clave en comandos ejecutados por usuarios no-root
+        if process_owner and process_owner!= "root":
+            for keyword in PRIVILEGE_ESCALATION_KEYWORDS:
+                if f"COMMAND={keyword}" in log_line or f"EXECVE={keyword}" in log_line:
+                    print(f"[!] Posible ESCALADA DE PRIVILEGIOS detectada para usuario {process_owner}: {log_line[:100]}...")
+                    return True
+        return False
+
+    # Función 19: Detección de Inyección de Comandos (Command Injection)
+    def detect_command_injection(self, log_line: str) -> bool:
+        """Detecta patrones de inyección de comandos en parámetros de entrada o URLs."""
+        for pattern in COMMAND_INJECTION_PATTERNS:
+            if re.search(pattern, log_line, re.IGNORECASE):
+                print(f"[!] Posible INYECCIÓN DE COMANDOS detectada en log: {log_line[:100]}...")
+                return True
+        return False
+
+    # Función 20: Detección de Movimiento Lateral (Lateral Movement)
+    def detect_lateral_movement(self, source_ip: str, dest_ip: str, service: str) -> bool:
+        """
+        Detecta movimientos laterales inusuales entre hosts dentro de la red.
+        Requiere monitorear conexiones internas. (Simulado por logs de UFW/Syslog con IPs internas)
+        """
+        if source_ip in self.whitelist or dest_ip in self.whitelist: return False
+        if service in ["SSH", "RDP", "SMB"] and self._is_internal_ip(source_ip) and self._is_internal_ip(dest_ip):
+            print(f"[!] Posible MOVIMIENTO LATERAL: {source_ip} conectando a {dest_ip} vía {service}!")
+            return True
+        return False
+
+    def _is_internal_ip(self, ip: str) -> bool:
+        # Simplificación: comprueba si la IP es privada (RFC1918)
+        private_ip_patterns = [
+            re.compile(r"^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$"),
+            re.compile(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$"),
+            re.compile(r"^192\.168\.\d{1,3}\.\d{1,3}$")
+        ]
+        for pattern in private_ip_patterns:
+            if pattern.match(ip):
+                return True
+        return False
+
+    # Función 21: Detección de Ataques de Ransomware (Ransomware Detection Heuristics)
+    def detect_ransomware(self, ip: str, file_name: str) -> bool:
+        """
+        Detecta actividades que sugieren un ataque de ransomware, como el cambio masivo de extensiones de archivos
+        o la creación de archivos de "HOW_TO_DECRYPT".
+        Requiere logs de actividad de archivos (ej. auditd).
+        """
+        if ip in self.whitelist: return False
+        now = time.time()
+        self.file_monitor_log[ip].append((file_name, now))
+
+        # Limpiar eventos antiguos
+        while self.file_monitor_log[ip] and self.file_monitor_log[ip][0][1] < now - 300: # Ventana de 5 minutos
+            self.file_monitor_log[ip].popleft()
+
+        # Detección de cambio de extensión
+        for ext in RANSOMWARE_FILE_EXTENSIONS:
+            if file_name.endswith(ext):
+                # Contar cuántos archivos con extensión de ransomware se han visto recientemente
+                ransom_files_count = sum(1 for f, t in self.file_monitor_log[ip] if f.endswith(ext))
+                if ransom_files_count >= FILE_RENAME_THRESHOLD: # Si muchos archivos son renombrados a extensiones de ransomware
+                    print(f"[!] ALERTA DE RANSOMWARE: {ip} está renombrando archivos a {ext}!")
+                    return True
+
+        # Detección de archivos de nota de rescate (simplificado)
+        if "HOW_TO_DECRYPT" in file_name.upper() or "RECOVER_YOUR_FILES" in file_name.upper():
+            print(f"[!] ALERTA DE RANSOMWARE: Nota de rescate detectada: {file_name}!")
+            return True
+
+        return False
+
+    # Función 22: Detección de Worms/Malware de Propagación Rápida (Worm/Rapid Malware Spread Detection)
+    def detect_worm_spread(self, source_ip: str, dest_ip: str, connections_count: int = 1) -> bool:
+        """
+        Detecta patrones de propagación rápida de malware o worms en la red.
+        Requiere monitorear conexiones inusuales salientes. (Simulado por logs)
+        """
+        if source_ip in self.whitelist: return False
+        now = time.time()
+        # Trackear conexiones salientes por IP
+        self.network_traffic_log[source_ip].append((connections_count, now))
+
+        # Limpiar eventos antiguos
+        while self.network_traffic_log[source_ip] and self.network_traffic_log[source_ip][0][1] < now - 60: # Ventana de 60 segundos
+            self.network_traffic_log[source_ip].popleft()
+
+        total_connections = sum(c for c, t in self.network_traffic_log[source_ip])
+        if total_connections > WORM_NETWORK_ACTIVITY_THRESHOLD: # Si una IP hace muchas conexiones a IPs diferentes
+            print(f"[!] Posible PROPAGACIÓN DE WORM/MALWARE: {source_ip} realizando {total_connections} conexiones inusuales!")
+            return True
+        return False
+
+    # Función 23: Detección de Procesos Maliciosos (Malicious Process Detection)
+    def detect_malicious_process(self, ip: str, process_command_line: str) -> bool:
+        """
+        Detecta la ejecución de comandos o procesos que son típicamente asociados con malware
+        o herramientas de ataque. Requiere logs de ejecución de procesos (ej. auditd).
+        """
+        if ip in self.whitelist: return False
+        now = time.time()
+        self.process_monitor_log[ip].append((process_command_line, now))
+
+        for keyword in SUPICIOUS_PROCESS_KEYWORDS:
+            if process_command_line and keyword in process_command_line.lower():
+                print(f"[!] PROCESO MALICIOSO detectado desde {ip}: {process_command_line[:100]}!")
+                return True
+        return False
+
+    # Función 24: Detección de Webshells (Webshell Detection Heuristics)
+    def detect_webshell(self, log_line: str, file_path: str = None) -> bool:
+        """
+        Detecta la subida o ejecución de webshells.
+        Requiere logs de acceso a servidores web y/o monitoreo de archivos en directorios web.
+        """
+        if file_path and (file_path.endswith(".php") or file_path.endswith(".asp") or file_path.endswith(".jsp")):
+            try:
+                with open(file_path, 'r', errors='ignore') as f:
+                    content = f.read(4096)
+                    for pattern in WEBSHELL_DETECTION_PATTERNS:
+                        if re.search(pattern, content, re.IGNORECASE | re.DOTALL):
+                            print(f"[!] WEBSHELL detectada en {file_path}!")
+                            return True
+            except Exception:
+                pass
+
+        if "eval(" in log_line or "shell_exec(" in log_line or "system(" in log_line:
+            print(f"[!] Posible WEBSHELL (por log de acceso): {log_line[:100]}!")
+            return True
+        return False
+
+    # Función 25: Detección de Exfiltración de Datos (Data Exfiltration)
+    def detect_data_exfiltration(self, source_ip: str, destination_ip: str, data_size_bytes: int) -> bool:
+        """
+        Detecta transferencia de grandes volúmenes de datos a destinos externos inusuales.
+        Requiere monitorear el tráfico de red. (Simulado por logs de conexiones)
+        """
+        if source_ip in self.whitelist: return False
+        now = time.time()
+        self.network_traffic_log[source_ip].append((data_size_bytes, now))
+
+        while self.network_traffic_log[source_ip] and self.network_traffic_log[source_ip][0][1] < now - 300: # Ventana de 5 minutos
+            self.network_traffic_log[source_ip].popleft()
+
+        total_data_out = sum(d for d, t in self.network_traffic_log[source_ip])
+        if total_data_out > DATA_EXFILTRATION_THRESHOLD_BYTES:
+            print(f"[!] Posible EXFILTRACIÓN DE DATOS: {source_ip} enviando {total_data_out/1024/1024:.2f}MB inusuales!")
+            return True
+        return False
+
+    # ==================== Funciones de soporte y detección general ====================
+
+    def detect_pattern_attack(self, line: str) -> Optional[str]:
+        """Detecta patrones generales de ataques basados en regex en el log."""
+        for pattern in self.suspicious_patterns:
+            match = re.search(pattern, line)
+            if match:
+                ip_match = re.search(r"SRC=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
+                if ip_match:
+                    return ip_match.group(1)
+        return None
+
+    def check_threat_intel(self, ip: str) -> Dict:
+        """Consulta la base de datos de inteligencia de amenazas para una IP."""
+        if ip in self.threat_intel:
+            return {"is_threat": True, "details": self.threat_intel[ip]}
+        return {"is_threat": False}
+
+    def health_check(self) -> Dict:
+        """Realiza un chequeo de salud del sistema."""
+        issues = []
+        if not os.path.exists(LOG_PATH):
+            issues.append(f"El archivo de log de UFW no se encuentra: {LOG_PATH}")
+        if not self._is_ufw_active():
+            issues.append("UFW no está activo o no está registrando logs.")
+        return {"issues": issues}
+
+    def _is_ufw_active(self) -> bool:
+        try:
+            result = subprocess.run(["ufw", "status"], capture_output=True, text=True)
+            return "Status: active" in result.stdout
+        except:
+            return False
+
+    def auto_remediate(self, health_info: Dict) -> List[str]:
+        """Intenta remediar automáticamente problemas de salud."""
+        remediated_actions = []
+        for issue in health_info.get('issues', []):
+            if "UFW no está activo" in issue:
+                try:
+                    subprocess.run(["ufw", "--force", "enable"], check=True)
+                    subprocess.run(["ufw", "logging", "on"], check=True)
+                    remediated_actions.append("UFW habilitado y logging activado.")
+                except:
+                    remediated_actions.append("Fallo al habilitar UFW automáticamente.")
+        return remediated_actions
+
+    def apply_countermeasure(self, ip: str, severity: str):
+        """Aplica contramedidas basadas en la severidad del ataque."""
+        if ip in self.whitelist:
+            print(f"[!] Intento de contramedida en IP en whitelist: {ip}. Ignorando.")
+            return
+
+        if severity == 'high':
+            print(f"[!] Contramedida: BAN inmediato para {ip} por ataque de alta severidad.")
+            self.state.attack_counter[ip] = self.config['threshold']
+        elif severity == 'medium':
+            print(f"[!] Contramedida: Monitoreo intensivo para {ip} por ataque de severidad media.")
+
+# ==================== CLASE DE EVALUACIÓN DE IA ====================
+class AIAssessment:
+    """
+    Clase para la evaluación inteligente de eventos de seguridad utilizando heurísticas y un modelo simplificado de "IA".
+    Esto simula un motor de IA que pondera diferentes factores.
+    """
+    def __init__(self, security_functions: SecurityFunctions, state: PersistentState):
+        self.security = security_functions
+        self.state = state
+        self.weights = {
+            "port_scan": 0.3,
+            "ddos": 0.5,
+            "brute_force": 0.7,
+            "geoblock": 0.6,
+            "known_attacker": 0.9,
+            "honeypot_interaction": 1.0,
+            "high_entropy": 0.8,
+            "http_header_anomaly": 0.4,
+            "sql_injection": 0.9,
+            "xss": 0.8,
+            "file_inclusion": 0.95,
+            "session_attack": 0.7,
+            "firewall_evasion": 0.85,
+            "c2_activity": 1.0,
+            "suspicious_pattern": 0.2,
+            "threat_intel_match": 0.9,
+            "file_integrity_violation": 0.8, # Peso añadido para esta función
+
+            # Nuevos pesos para las 10 funciones de última generación
+            "network_scan": 0.75,
+            "dns_anomaly": 0.6,
+            "privilege_escalation": 0.98,
+            "command_injection": 0.92,
+            "lateral_movement": 0.9,
+            "ransomware": 1.0,
+            "worm_spread": 0.95,
+            "malicious_process": 0.9,
+            "webshell": 0.99,
+            "data_exfiltration": 0.88,
+        }
+        self.detection_threshold = 0.7
+
+    def assess_event(self, ip: str, port: Optional[int], log_line: str) -> Tuple[bool, str, float]:
+        """
+        Evalúa un evento de seguridad utilizando múltiples funciones y heurísticas de IA.
+        Retorna (es_amenaza, tipo_amenaza, score_severidad).
+        """
+        if ip in self.security.whitelist:
+            return False, "whitelist", 0.0
+
+        current_score = 0.0
+        threat_type = "unknown"
+        detected_features = []
+
+        # Chequeos de seguridad existentes
+        if self.security.check_known_attacker(ip):
+            current_score += self.weights["known_attacker"]
+            threat_type = "known_attacker"
+            detected_features.append("known_attacker")
+        if ip in self.security.blacklist:
+            current_score = 1.0
+            threat_type = "blacklist_match"
+            detected_features.append("blacklist_match")
+        if self.security.detect_pattern_attack(log_line):
+            current_score += self.weights["suspicious_pattern"]
+            if threat_type == "unknown":
+                threat_type = "suspicious_pattern"
+            detected_features.append("suspicious_pattern")
+        if self.security.check_geoblock(ip):
+            current_score += self.weights["geoblock"]
+            if threat_type == "unknown":
+                threat_type = "geoblock"
+            detected_features.append("geoblock")
+        threat_intel_data = self.security.check_threat_intel(ip)
+        if threat_intel_data["is_threat"]:
+            current_score += self.weights["threat_intel_match"]
+            if threat_type == "unknown":
+                threat_type = "threat_intel_match"
+            category = threat_intel_data['details'].get('category', 'N/A')
+            detected_features.append(f"threat_intel:{category}")
+        if port and self.security.detect_port_scan(ip, port):
+            current_score += self.weights["port_scan"]
+            if threat_type == "unknown":
+                threat_type = "port_scan"
+            detected_features.append("port_scan")
+        if self.security.detect_ddos(ip):
+            current_score += self.weights["ddos"]
+            if threat_type == "unknown":
+                threat_type = "ddos"
+            detected_features.append("ddos")
+        if "FAILED_PASSWORD" in log_line or "Authentication failure" in log_line:
+            if self.security.detect_brute_force(ip, success=False):
+                current_score += self.weights["brute_force"]
+                if threat_type == "unknown":
+                    threat_type = "brute_force"
+                detected_features.append("brute_force")
+        if self.security.detect_honeypot_interaction(ip, log_line):
+            current_score += self.weights["honeypot_interaction"]
+            if threat_type == "unknown":
+                threat_type = "honeypot_interaction"
+            detected_features.append("honeypot_interaction")
+        if self.security.analyze_entropy(log_line, threshold=4.5):
+            current_score += self.weights["high_entropy"]
+            if threat_type == "unknown":
+                threat_type = "high_entropy_payload"
+            detected_features.append("high_entropy")
+        if self.security.validate_http_headers(log_line):
+            current_score += self.weights["http_header_anomaly"]
+            if threat_type == "unknown":
+                threat_type = "http_header_anomaly"
+            detected_features.append("http_header_anomaly")
+        if self.security.detect_sql_injection(log_line):
+            current_score += self.weights["sql_injection"]
+            if threat_type == "unknown":
+                threat_type = "sql_injection"
+            detected_features.append("sql_injection")
+        if self.security.detect_xss(log_line):
+            current_score += self.weights["xss"]
+            if threat_type == "unknown":
+                threat_type = "xss_attempt"
+            detected_features.append("xss_attempt")
+        if self.security.detect_file_inclusion(log_line):
+            current_score += self.weights["file_inclusion"]
+            if threat_type == "unknown":
+                threat_type = "file_inclusion"
+            detected_features.append("file_inclusion")
+        if self.security.detect_session_attack(log_line):
+            current_score += self.weights["session_attack"]
+            if threat_type == "unknown":
+                threat_type = "session_attack"
+            detected_features.append("session_attack")
+        if self.security.detect_firewall_evasion(log_line):
+            current_score += self.weights["firewall_evasion"]
+            if threat_type == "unknown":
+                threat_type = "firewall_evasion"
+            detected_features.append("firewall_evasion")
+        if self.security.check_file_integrity_log(log_line):
+            current_score += self.weights["file_integrity_violation"]
+            if threat_type == "unknown":
+                threat_type = "file_integrity_violation"
+            detected_features.append("file_integrity_violation")
+        if self.security.detect_c2_activity(log_line):
+            current_score += self.weights["c2_activity"]
+            if threat_type == "unknown":
+                threat_type = "c2_activity"
+            detected_features.append("c2_activity")
+
+        # Nuevas funciones de última generación
+        # Notar que algunas de estas funciones necesitan más contexto que solo la log_line y la IP.
+        # Aquí se simula la extracción de esos datos. Para una implementación real, se necesitaría un parser de logs más avanzado.
+
+        # Detección de Escaneo de Red: Necesita IP, Puerto, Protocolo
+        if port and self.security.detect_network_scan(ip, port, "TCP"):
+            current_score += self.weights["network_scan"]
+            if threat_type == "unknown":
+                threat_type = "network_scan"
+            detected_features.append("network_scan")
+
+        # Detección de Anomalías DNS: Necesita IP
+        if self.security.detect_dns_anomaly(ip):
+            current_score += self.weights["dns_anomaly"]
+            if threat_type == "unknown":
+                threat_type = "dns_anomaly"
+            detected_features.append("dns_anomaly")
+
+        # Detección Heurística de Escalada de Privilegios: Necesita log_line y owner
+        process_owner_match = re.search(r"USER=(\w+)", log_line) # Simulación de extracción de usuario
+        process_owner = process_owner_match.group(1) if process_owner_match else None
+        if self.security.detect_privilege_escalation(log_line, process_owner):
+            current_score += self.weights["privilege_escalation"]
+            if threat_type == "unknown":
+                threat_type = "privilege_escalation"
+            detected_features.append("privilege_escalation")
+
+        # Detección de Inyección de Comandos: Necesita log_line
+        if self.security.detect_command_injection(log_line):
+            current_score += self.weights["command_injection"]
+            if threat_type == "unknown":
+                threat_type = "command_injection"
+            detected_features.append("command_injection")
+
+        # Detección de Movimiento Lateral: Necesita Source IP, Destination IP, Service
+        dest_ip_match = re.search(r"(DST|DPT_IP)=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", log_line) # Simulación de extracción de IP de destino
+        dest_ip = dest_ip_match.group(2) if dest_ip_match else "0.0.0.0" # Default si no se encuentra
+        service_match = re.search(r"PROTO=(\w+)", log_line) # Simulación de extracción de servicio
+        service = service_match.group(1) if service_match else "unknown"
+        if self.security.detect_lateral_movement(ip, dest_ip, service):
+            current_score += self.weights["lateral_movement"]
+            if threat_type == "unknown":
+                threat_type = "lateral_movement"
+            detected_features.append("lateral_movement")
+
+        # Detección de Ataques de Ransomware: Necesita IP, file_name
+        file_name_match = re.search(r"FILE=(\S+)", log_line) # Simulación de extracción de nombre de archivo
+        file_name = file_name_match.group(1) if file_name_match else "unknown_file"
+        if self.security.detect_ransomware(ip, file_name):
+            current_score += self.weights["ransomware"]
+            if threat_type == "unknown":
+                threat_type = "ransomware"
+            detected_features.append("ransomware")
+
+        # Detección de Worms/Malware de Propagación Rápida: Necesita Source IP, Destination IP, Connections Count
+        connections_count_match = re.search(r"CONNECTIONS=(\d+)", log_line) # Simulación de extracción de contador de conexiones
+        connections_count = int(connections_count_match.group(1)) if connections_count_match else 1
+        if self.security.detect_worm_spread(ip, dest_ip, connections_count):
+            current_score += self.weights["worm_spread"]
+            if threat_type == "unknown":
+                threat_type = "worm_spread"
+            detected_features.append("worm_spread")
+
+        # Detección de Procesos Maliciosos: Necesita IP, process_command_line
+        command_line_match = re.search(r"CMD='([^']+)'", log_line) # Simulación de extracción de línea de comando
+        process_command_line = command_line_match.group(1) if command_line_match else log_line # Usar línea completa como fallback
+        if self.security.detect_malicious_process(ip, process_command_line):
+            current_score += self.weights["malicious_process"]
+            if threat_type == "unknown":
+                threat_type = "malicious_process"
+            detected_features.append("malicious_process")
+
+        # Detección de Webshells: Necesita log_line, file_path
+        # file_name ya fue extraído para ransomware, lo usamos si aplica
+        if self.security.detect_webshell(log_line, file_name):
+            current_score += self.weights["webshell"]
+            if threat_type == "unknown":
+                threat_type = "webshell"
+            detected_features.append("webshell")
+
+        # Detección de Exfiltración de Datos: Necesita Source IP, Destination IP, Data Size
+        data_size_match = re.search(r"BYTES=(\d+)", log_line) # Simulación de extracción de tamaño de datos
+        data_size = int(data_size_match.group(1)) if data_size_match else 0
+        if self.security.detect_data_exfiltration(ip, dest_ip, data_size):
+            current_score += self.weights["data_exfiltration"]
+            if threat_type == "unknown":
+                threat_type = "data_exfiltration"
+            detected_features.append("data_exfiltration")
+
+        final_score = min(current_score, 1.0)
+        is_threat_ai = final_score >= self.detection_threshold
+
+        if is_threat_ai:
+            self.state.statistics["ai_detected_threats"] += 1
+            print(f"[AI] Amenaza detectada por IA de {threat_type} desde {ip}. Score: {final_score:.2f}. Features: {', '.join(detected_features)}")
+        elif detected_features:
+             print(f"[AI] Actividad sospechosa detectada desde {ip} (Score: {final_score:.2f}, Features: {', '.join(detected_features)}), pero no alcanzó el umbral de IA.")
+
+        self.state.recent_events.append({
+            "timestamp": time.time(),
+            "ip": ip,
+            "port": port,
+            "log_line": log_line,
+            "score": final_score,
+            "threat_type": threat_type,
+            "is_threat_ai": is_threat_ai,
+            "detected_features": detected_features
+        })
+        self.state.save()
+
+        return is_threat_ai, threat_type, final_score
+
+# ==================== MAIN DAEMON ====================
+class ShieldDaemon:
+    """Daemon principal de ShieldLinux"""
+
+    def __init__(self):
+        self.config = {
+            'threshold': THRESHOLD,
+            'ban_time': BAN_TIME_DEFAULT,
+            'scan_threshold': SCAN_THRESHOLD,
+            'ddos_threshold': DDOS_THRESHOLD,
+            'rate_limit_window': RATE_LIMIT_WINDOW,
+            'brute_force_threshold': BRUTE_FORCE_THRESHOLD,
+            'brute_force_window': BRUTE_FORCE_WINDOW,
+            'dns_anomaly_threshold': DNS_ANOMALY_THRESHOLD,
+            'network_scan_ports_count': NETWORK_SCAN_PORTS_COUNT,
+            'network_scan_time_window': NETWORK_SCAN_TIME_WINDOW,
+            'file_rename_threshold': FILE_RENAME_THRESHOLD,
+            'worm_network_activity_threshold': WORM_NETWORK_ACTIVITY_THRESHOLD,
+            'data_exfiltration_threshold_bytes': DATA_EXFILTRATION_THRESHOLD_BYTES
+        }
+
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        for _file in [WHITELIST_FILE, BLACKLIST_FILE, THREAT_INTEL_FILE]:
+            if not os.path.exists(_file):
+                with open(_file, 'w') as f:
+                    json.dump({"ips": []}, f, indent=2)
+
+        self.state = PersistentState(STATE_FILE)
+        self.notifier = NotificationSystem()
+        self.security = SecurityFunctions(self.state, self.config)
+        self.ban_manager = BanManager(self.state, self.notifier, self.security)
+        self.ai_analyzer = AIAssessment(self.security, self.state)
+
+        # ==================== FUNCIONALIDADES EXTREME ====================
+        self.honeypot = DynamicHoneypot()
+        self.sinkhole = TCPSinkhole()
+        self.rate_shaper = ConnectionRateShaper()
+        self.syn_cookie = SYNCookieDefense()
+        self.threat_intel = ThreatIntelligenceFeed()
+        self.cascade_ban = CascadeBanManager()
+        self.tarpit = TarpitDefense()
+        self.yara_engine = YaraRulesEngine()
+        self.sigma_engine = SigmaRulesEngine()
+        self.log_correlator = LogCorrelationEngine()
+
+        # ==================== 15 FUNCIONES EXTREME ADICIONALES ====================
+        self.ip_reputation = IPReputationSystem()
+        self.port_knocking_detector = PortKnockingDetector()
+        self.dns_tunnel_detector = DNSTunnelingDetector()
+        self.icmp_flood_protector = ICMPFloodProtector()
+        self.udp_flood_protector = UDPFloodProtector()
+        self.http_flood_detector = HTTPFloodDetector()
+        self.ssh_honeypot = SSHHoneypot()
+        self.geoip_blocker = GeoIPBlocker()
+        self.asn_blocker = ASNBlocker()
+        self.time_rules = TimeBasedRules()
+        self.auto_whitelist = AutoWhitelistLearner()
+        self.decoy_detector = DecoyDetector()
+        self.fragment_detector = FragmentAttackDetector()
+        self.invalid_packet_detector = InvalidPacketDetector()
+        self.connection_tracker = ConnectionTracker()
+
+        # Países bloqueados por defecto (ajustar según necesidades)
+        self.geoip_blocker.add_blocked_country("CN")  # China (todos los rangos IP)
+        self.geoip_blocker.add_blocked_country("KP")  # Corea del Norte
+        self.geoip_blocker.add_blocked_country("IR")  # Irán
+
+        # Activar SYN cookies al inicio
+        self.syn_cookie.enable_syn_cookies()
+
+        # Iniciar monitoreo de auth.log en thread separado
+        self.auth_monitor_thread = threading.Thread(target=self.log_correlator.monitor_auth_log, daemon=True)
+        self.auth_monitor_thread.start()
+
+        # Rate limiting para evitar saturación por ataques DDoS
+        self.last_ban_attempt: Dict[str, float] = {}  # IP -> timestamp del último intento de ban
+        self.ban_cooldown = 10  # Segundos mínimos entre intentos de ban para la misma IP
+        self.processing_lock = False  # Evitar procesamiento concurrente
+
+    def process_attack(self, ip: str, port: Optional[int] = None, log_line: str = ""):
+        """Procesa un ataque detectado, incrementa contadores y aplica contramedidas EXTREME."""
+        # Evitar procesamiento concurrente
+        if self.processing_lock:
+            return
+        self.processing_lock = True
+
+        try:
+            now = time.time()
+
+            # Verificaciones tempranas
+            if ip in self.security.whitelist or ip in SYSTEM_WHITELIST:
+                return
+
+            # RATE LIMITING: Si ya fue baneada recientemente, saltar
+            if ip in self.last_ban_attempt:
+                if now - self.last_ban_attempt[ip] < self.ban_cooldown:
+                    self.processing_lock = False
+                    return
+
+            # Verificar si ya está baneada en el estado interno
+            if ip in self.state.banned_ips or ip in self.state.temp_bans:
+                self.state.attack_counter[ip] = self.state.attack_counter.get(ip, 0) + 1
+                self.processing_lock = False
+                return
+
+            # ==================== DETECCIONES EXTREME ====================
+
+            # 1. Honeypot Detection
+            if port and port in self.honeypot.honeypot_ports:
+                if self.honeypot.register_interaction(ip, port):
+                    print(f"[🍯 HONEYPOT] {ip} cayó en la trampa → BAN INMEDIATO")
+                    self.last_ban_attempt[ip] = now
+                    self.ban_manager.ban_ip(ip, BAN_TIME_DEFAULT, "honeypot_interaction")
+                    self.cascade_ban.register_attack(ip)
+                    self.processing_lock = False
+                    return
+
+            # 2. Threat Intelligence (AbuseIPDB + Spamhaus)
+            if now - self.threat_intel.last_feed_update > self.threat_intel.feed_update_interval:
+                self.threat_intel.update_spamhaus_drop()
+                self.threat_intel.last_feed_update = now
+
+            if self.threat_intel.check_spamhaus_drop(ip):
+                print(f"[🌐 SPAMHAUS] {ip} en lista DROP → BAN INMEDIATO")
+                self.last_ban_attempt[ip] = now
+                self.ban_manager.ban_ip(ip, BAN_TIME_DEFAULT, "spamhaus_drop_list")
+                self.processing_lock = False
+                return
+
+            abuseipdb_result = self.threat_intel.check_abuseipdb(ip)
+            if abuseipdb_result.get("is_malicious"):
+                print(f"[🌐 ABUSEIPDB] {ip} tiene score {abuseipdb_result.get('score')}% → BAN")
+                self.last_ban_attempt[ip] = now
+                self.ban_manager.ban_ip(ip, BAN_TIME_DEFAULT, f"abuseipdb_score_{abuseipdb_result.get('score')}")
+                self.processing_lock = False
+                return
+
+            # 3. YARA Rules Detection
+            yara_matches = self.yara_engine.scan_log(log_line)
+            if yara_matches:
+                print(f"[🦠 YARA] Malware detectado desde {ip}: {yara_matches}")
+                self.last_ban_attempt[ip] = now
+                self.ban_manager.ban_ip(ip, BAN_TIME_DEFAULT, f"yara_{yara_matches[0]}")
+                self.processing_lock = False
+                return
+
+            # 4. Sigma Rules (MITRE ATT&CK)
+            sigma_matches = self.sigma_engine.scan_log(log_line)
+            mitre_severity = "low"
+            for match in sigma_matches:
+                if match["severity"] == "critical":
+                    mitre_severity = "critical"
+                elif match["severity"] == "high" and mitre_severity != "critical":
+                    mitre_severity = "high"
+
+            if mitre_severity in ["critical", "high"]:
+                print(f"[📋 MITRE ATT&CK] Técnica {sigma_matches[0]['mitre_id']} detectada → BAN")
+                self.last_ban_attempt[ip] = now
+                self.ban_manager.ban_ip(ip, BAN_TIME_DEFAULT, f"mitre_{sigma_matches[0]['mitre_id']}")
+                self.processing_lock = False
+                return
+
+            # 5. Log Correlation
+            if port:
+                self.log_correlator.add_ufw_event(ip, port)
+            correlation_result = self.log_correlator.correlate_attack(ip)
+            if correlation_result["is_coordinated"]:
+                print(f"[🔗 CORRELATION] {correlation_result['attack_type']} desde {ip}")
+                self.last_ban_attempt[ip] = now
+                self.ban_manager.ban_ip(ip, BAN_TIME_DEFAULT, "coordinated_attack")
+                # Activar TARPIT para ataques coordinados
+                self.tarpit.add_tarpit(ip)
+                self.processing_lock = False
+                return
+
+            # 6. Ban en Cascada (verificar antes de banear)
+            subnet_to_ban = self.cascade_ban.register_attack(ip)
+            if subnet_to_ban:
+                print(f"[⚠️ CASCADE BAN] Baneando subnet completa: {subnet_to_ban}")
+                # Baneamos la subnet completa usando iptables directamente
+                try:
+                    subprocess.run(
+                        ["iptables", "-A", "INPUT", "-s", subnet_to_ban, "-j", "DROP"],
+                        check=True, capture_output=True
+                    )
+                    print(f"[✅ CASCADE BAN] {subnet_to_ban} bloqueada completamente")
+                except Exception as e:
+                    print(f"[!] Error baneando subnet {subnet_to_ban}: {e}")
+
+            # ==================== DETECCIÓN IA TRADICIONAL ====================
+            is_threat_ai, threat_type_ai, ai_score = self.ai_analyzer.assess_event(ip, port, log_line)
+
+            severity = 'low'
+            if is_threat_ai:
+                severity = 'high'
+            elif self.security.detect_port_scan(ip, port):
+                severity = 'medium'
+            elif self.security.detect_ddos(ip):
+                severity = 'high'
+                # Activar rate shaping para DDoS
+                self.rate_shaper.set_rate_limit(ip, limit_per_sec=5, burst=10)
+            elif self.security.detect_brute_force(ip, service="SSH" if port == 22 else "unknown"):
+                severity = 'high'
+            elif self.security.check_geoblock(ip):
+                severity = 'medium'
+            elif self.security.check_known_attacker(ip):
+                severity = 'high'
+            elif ip in self.security.blacklist:
+                severity = 'high'
+
+            self.security.apply_countermeasure(ip, severity)
+
+            if severity != 'low' or is_threat_ai:
+                self.state.attack_counter[ip] = self.state.attack_counter.get(ip, 0) + 1
+                self.state.attack_timestamps[ip].append(time.time())
+                self.state.statistics['total_attacks'] += 1
+                self.state.statistics['last_attack'] = datetime.now().isoformat()
+
+                today = datetime.now().strftime('%Y-%m-%d')
+                self.state.statistics['attacks_by_day'][today] += 1
+
+                threshold_to_use = self.config['threshold']
+                if is_threat_ai and ai_score >= 0.9:
+                    threshold_to_use = 1
+                elif is_threat_ai and ai_score >= self.ai_analyzer.detection_threshold:
+                    threshold_to_use = max(1, self.config['threshold'] // 2)
+
+                if self.state.attack_counter[ip] >= threshold_to_use:
+                    self.last_ban_attempt[ip] = time.time()
+
+                    if self.ban_manager._check_ufw_rule_exists(ip):
+                        print(f"[i] IP {ip} ya tiene regla UFW, omitiendo ban duplicado.")
+                        self.processing_lock = False
+                        return
+
+                    reason = threat_type_ai if is_threat_ai else "threshold_exceeded"
+                    self.ban_manager.ban_ip(ip, self.config['ban_time'], reason)
+
+            if self.state.statistics['total_attacks'] % 10 == 0:
+                counter = Counter(self.state.attack_counter.keys())
+                self.state.statistics['top_attackers'] = counter.most_common(10)
+
+            if self.state.statistics['total_attacks'] % 5 == 0:
+                self.state.save()
+        finally:
+            self.processing_lock = False
+
+    def parse_log_line(self, line: str) -> Optional[Tuple[str, Optional[int], Optional[str]]]:
+        """Extrae IP, puerto y protocolo de una línea de log UFW."""
+        ip_match = re.search(r"SRC=([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", line)
+        port_match = re.search(r"DPT=(\d+)", line)
+        proto_match = re.search(r"PROTO=(\w+)", line)
+
+        if ip_match:
+            ip = ip_match.group(1)
+            port = int(port_match.group(1)) if port_match else None
+            protocol = proto_match.group(1) if proto_match else "TCP" # Default a TCP si no se especifica
+            return (ip, port, protocol)
+        return None
+
+    def generate_report(self) -> str:
+        """Genera un reporte de seguridad detallado."""
+        stats = self.state.statistics
+        report = f"""
+╔═════════════════════════════════════════���═════════════════╗
+║ 🛡️ SHIELD LINUX v4.1 - REPORTE DE SEGURIDAD ║
+╠═══════════════════════════════════════════════════════════╣
+║ Total de ataques: {stats['total_attacks']:,}
+║ Total de bans: {stats['total_bans']:,}
+║ IPs actualmente baneadas: {len(self.state.banned_ips)}
+║ Desde: {stats['start_time']}
+║ Último ataque: {stats['last_attack'] or 'N/A'}
+╠══════════════════════���════════════════════════════════════╣
+║ Detección por IA:
+║ Amenazas detectadas: {stats['ai_detected_threats']:,}
+║ Falsos positivos (aprox): {stats['ai_false_positives']:,}
+╠═══════════════════════════════════════════════════════════╣
+║ TOP 10 ATACANTES:
+"""
+        for i, (ip, count) in enumerate(stats.get('top_attackers', [])[:10], 1):
+            report += f"║ {i}. {ip}: {count} ataques\n"
+
+        report += """╠═══════════════════════════════════════════════════════════╣
+║ EVENTOS RECIENTES (Últimos 5):
+"""
+        for event in list(self.state.recent_events)[-5:]:
+            event_time = datetime.fromtimestamp(event['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+            report += f"║ [{event_time}] IP: {event['ip']} - Tipo: {event['threat_type']} (IA: {event['is_threat_ai']}) Score: {event['score']:.2f}\n"
+
+        report += "╚═════════��═══════���═════════════════════════════════════════╝"
+        return report
+
+    def run(self):
+        """Ejecuta el daemon principal."""
+        print("=" * 60)
+        print("🛡️ SHIELD LINUX v6.0 ULTRA - Nivel Militar EXTREME")
+        print("=" * 60)
+        print("📊 FUNCIONALIDADES ACTIVAS:")
+        print(f"   🍯 Honeypot: {len(self.honeypot.honeypot_ports)} puertos trampa")
+        print(f"   🌐 Threat Intel: AbuseIPDB ({len(ABUSEIPDB_API_KEYS)} keys rotativas) + Spamhaus")
+        print(f"   🦠 YARA: {len(self.yara_engine.rules)} reglas")
+        print(f"   📋 MITRE ATT&CK: {len(self.sigma_engine.sigma_rules)} técnicas")
+        print(f"   🔗 Log Correlation: UFW + auth.log + syslog")
+        print(f"   ⚠️  Cascade Ban: Subnets /24 automáticas")
+        print(f"   🪤 Tarpit: Activado para ataques coordinados")
+        print(f"   📊 IP Reputation: {self.ip_reputation.ban_threshold} score para ban")
+        print(f"   🚪 Port Knocking: {self.port_knocking_detector.knock_threshold} puertos = detect")
+        print(f"   🌐 DNS Tunnel: {self.dns_tunnel_detector.query_threshold} queries = alert")
+        print(f"   ❄️ ICMP Flood: {self.icmp_flood_protector.icmp_threshold} pings = ban")
+        print(f"   📡 UDP Flood: {self.udp_flood_protector.udp_threshold} paquetes = ban")
+        print(f"   🌐 HTTP Flood: {self.http_flood_detector.http_threshold} req/seg = ban")
+        print(f"   🍯 SSH Honeypot: {len(self.ssh_honeypot.fake_banners)} banners falsos")
+        print(f"   🌍 GeoIP Block: {len(self.geoip_blocker.blocked_countries)} países ({', '.join(self.geoip_blocker.blocked_countries)})")
+        print(f"      ├─ China: {len(self.geoip_blocker.china_ranges)} rangos IP")
+        print(f"      └─ Corea del Norte: {len(self.geoip_blocker.north_korea_ranges)} rangos IP")
+        print(f"   ⏰ Time Rules: Modo nocturno {self.time_rules.night_start}:00-{self.time_rules.night_end}:00")
+        print(f"   🎭 Decoy Detect: {self.decoy_detector.decoy_threshold} IPs = alerta")
+        print(f"   🧩 Fragment Attack: {self.fragment_detector.fragment_threshold} fragmentos = ban")
+        print(f"   🔗 Conn Limit: {self.connection_tracker.max_connections} conexiones máx")
+        print(f"   🔄 API Key Rotation: {len(ABUSEIPDB_API_KEYS)} keys AbuseIPDB configuradas")
+        print("=" * 60)
+        print("🚀 40+ CAPAS DE DEFENSA ACTIVAS - FIREWALL INFRANQUEABLE")
+        print("=" * 60)
+
+        health = self.security.health_check()
+        if health['issues']:
+            print("[!] Problemas detectados:")
+            for issue in health['issues']:
+                print(f" - {issue}")
+            remediated = self.security.auto_remediate(health)
+            if remediated:
+                print("[✓] Acciones tomadas:", remediated)
+
+        if not os.path.exists(LOG_PATH):
+            print(f"[!] Error: No se encuentra {LOG_PATH}. ¿Está UFW activo?")
+            print(" Ejecute: sudo ufw enable && sudo ufw logging on")
+            return
+
+        print(f"[✓] Monitoreando: {LOG_PATH}")
+        print(f"[✓] Threshold adaptativo: {THRESHOLD} intentos (modificado por IA)")
+        print(f"[✓] Funciones de seguridad activas: 25+ (potenciadas por IA)")
+        print("-" * 60)
+
+        import atexit
+        atexit.register(self.state.save)
+        atexit.register(lambda: print(self.generate_report()))
+
+        with open(LOG_PATH, "r") as f:
+            f.seek(0, os.SEEK_END)
+
+            last_cleanup = time.time()
+            cleanup_interval = 60  # Limpiar rate limit cache cada 60 segundos
+
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.1)  # Evitar busy-waiting
+                    continue
+
+                # Limpieza periódica de bans expirados
+                expired = self.state.cleanup_expired_bans()
+                for ip in expired:
+                    self.ban_manager.unban_ip(ip)
+
+                # Limpieza periódica del cache de rate limiting
+                now = time.time()
+                if now - last_cleanup > cleanup_interval:
+                    # Eliminar IPs del cache que ya pasaron el cooldown
+                    expired_attempts = [
+                        ip for ip, ts in self.last_ban_attempt.items()
+                        if now - ts > self.ban_cooldown * 2
+                    ]
+                    for ip in expired_attempts:
+                        del self.last_ban_attempt[ip]
+                    last_cleanup = now
+
+                parsed_info = self.parse_log_line(line)
+
+                if parsed_info:
+                    ip, port, protocol = parsed_info
+                    self.process_attack(ip, port, line)
+                else:
+                    ip_match_generic = re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', line)
+                    if ip_match_generic:
+                        ip_generic = ip_match_generic.group(0)
+                        self.process_attack(ip_generic, None, line)
+
+# ==================== ENTRY POINT ====================
+if __name__ == "__main__":
+    if os.geteuid()!= 0:
+        print("[!] Este servicio debe correr como root.")
+        print(" Use: sudo python3 shield_daemon_updated.py")
+        exit(1)
+
+    daemon = ShieldDaemon()
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        print("\n[✓] ShieldDaemon detenido. Guardando estado y generando reporte final...")
+    except Exception as e:
+        print(f"[!] Error crítico: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        daemon.state.save()
+        print(daemon.generate_report())

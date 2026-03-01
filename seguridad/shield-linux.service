@@ -1,0 +1,44 @@
+[Unit]
+Description=ShieldLinux Security Daemon - Advanced Firewall Protection
+Documentation=https://github.com/shield-linux
+After=network.target network-online.target ufw.service
+Wants=ufw.service
+Requires=ufw.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/shield-linux
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shield-linux
+
+# Seguridad del servicio (hardening)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/shield_linux /var/log /var/lib/shield_linux /etc/ufw
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Capabilities necesarias
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Logging
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONFAULTHANDLER=1
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=64
+
+[Install]
+WantedBy=multi-user.target
